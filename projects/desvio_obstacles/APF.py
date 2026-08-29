@@ -1,109 +1,146 @@
+import math
 import numpy as np
 
-deg2rad=3.14/180.
-rad2deg=180./3.14
+deg2rad = math.pi / 180.0
+rad2deg = 180.0 / math.pi
 
-def compute_forces(q = (0, 0), q_goal = (1, 1), q_obstacles = []):
-    # Attractive force constant
+# Parâmetros Globais do APF
+Kp = 1.2
+q_goal = np.array([1.0, -2.0])
+q_obstacles = [np.array([0.4, -0.8]), np.array([0.7, -1.4])]
+
+def create_cylinder(sim, pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], alias="Cylinder"):
+    """ Cria cilindros 3D dinamicamente na cena durante a simulação """
+    try:
+        sizes = [radius * 2, radius * 2, height]
+        res = sim.createPrimitiveShape(2, sizes, 0)
+        shape_handle = res[0] if isinstance(res, (list, tuple)) else res
+
+        sim.setObjectAlias(shape_handle, alias)
+        sim.setObjectPosition(shape_handle, -1, [pos[0], pos[1], height / 2.0])
+
+        try:
+            sim.setShapeColor(shape_handle, None, sim.colorcomponent_ambient_diffuse, color)
+        except:
+            try:
+                sim.setObjectColor(shape_handle, 0, sim.colorcomponent_ambient_diffuse, color)
+            except:
+                pass
+
+        sim.setObjectInt32Param(shape_handle, sim.shapeintparam_static, 1)
+        sim.setObjectInt32Param(shape_handle, sim.shapeintparam_respondable, 1)
+
+        return shape_handle
+    except Exception as e:
+        print(f"Erro ao criar cilindro {alias}: {e}")
+        return None
+
+def compute_forces(q, q_goal, q_obstacles):
     k_attractive = 1.0
+    k_repulsive = 1.5
+    d_safe = 0.8
+
+    # 1. Força Atrativa (do robô para o objetivo)
     f_attractive = k_attractive * (q_goal - q)
 
-    k_repulsive = 1.0
-    # Safe distance from obstacles
-    d_safe = 0.5
+    # 2. Força Repulsiva (do obstáculo para o robô)
     f_repulsive = []
     for q_obs in q_obstacles:
-        f_repulsive.append(k_repulsive * (1/np.linalg.norm(q - q_obs) - 1/d_safe) * (q - q_obs) / np.linalg.norm(q - q_obs))
+        dist = np.linalg.norm(q - q_obs)
+        if dist <= d_safe and dist > 0.01:
+            f_rep = k_repulsive * (1.0 / dist - 1.0 / d_safe) * ((q - q_obs) / (dist ** 2))
+            f_repulsive.append(f_rep)
 
-    f = f_attractive + np.sum(f_repulsive, axis=0)
-    return f
+    if len(f_repulsive) > 0:
+        f_rep_total = np.sum(f_repulsive, axis=0)
+    else:
+        f_rep_total = np.array([0.0, 0.0])
+
+    return f_attractive + f_rep_total
 
 def sysCall_init():
     sim = require('sim')
 
-    self.rightMotorHandle=sim.getObject("/rightMotor")
-    self.leftMotorHandle=sim.getObject("/leftMotor")
-    self.proximitySensorHandle=sim.getObject("/proximitySensor")
-    print("Keyboard listener started... (press ESC to stop simulation)")
+    # Handles dos componentes do robô
+    self.robotHandle = sim.getObject(".")
+    self.rightMotorHandle = sim.getObject("/rightMotor")
+    self.leftMotorHandle = sim.getObject("/leftMotor")
+    self.proximitySensorHandle = sim.getObject("/proximitySensor")
     
-    global ui, simUI, linVel, rotVel, L, max_linVel , max_rotVel, wheelradius
-
-    # Define the initial values for the linear and rotational velocities, wheel radius, and maximum velocities
-    linVel=0
-    rotVel=0
-    wheelradius=0.05
-    L=0.2  
-    max_linVel = 0.5
+    # Constantes físicas do robô
+    global L, max_linVel, max_rotVel, wheelradius
+    wheelradius = 0.05
+    L = 0.2  
+    max_linVel = 0.4
     max_rotVel = 90 * deg2rad
-    # Load the simUI plugin
-    sim = require('sim')
-    simUI = require('simUI')    
-    
-    # Define the UI
-    xml = '''
-    <ui title="Slider Example" closeable="true" resizable="true" activate="false" layout="vbox">
-        
-        <!-- Top button -->
-        <button text="0 Lin Vel" on-click="stopButtonPressed" />
 
-        <!-- Vertical slider centered -->
-        <group layout="hbox" flat="true">
-            <stretch />
-            <vslider id="2" minimum="-50" maximum="50" value="0" on-change="vslider_changed" />
-            <stretch />
-        </group>
+    self.spawned_objects = []
 
-        <!-- Horizontal slider with button at left -->
-        <group layout="hbox" flat="true">
-            <button text="0 rot vel" on-click="rotButtonPressed" />
-            <hslider id="1" minimum="-50" maximum="50" value="0" on-change="hslider_changed" />
-        </group>
+    # Criar Objetivo (Verde) e Obstáculos (Vermelhos) na cena
+    goal_handle = create_cylinder(sim, q_goal, radius=0.1, height=0.4, color=[0.0, 1.0, 0.0], alias="Goal_Cylinder")
+    if goal_handle:
+        self.spawned_objects.append(goal_handle)
 
-    </ui>
-    '''
-    ui = simUI.create(xml)
+    for i, obs_pos in enumerate(q_obstacles):
+        obs_handle = create_cylinder(sim, obs_pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], alias=f"Obstacle_Cylinder_{i}")
+        if obs_handle:
+            self.spawned_objects.append(obs_handle)
 
-def vslider_changed(ui, id, newVal):
-    global linVel
-    linVel=(newVal)/50 * max_linVel 
-    print(f"vertical slider value: {newVal}", linVel )
-
-def hslider_changed(ui, id, newVal):
-    global rotVel
-    rotVel=(newVal)/50 * max_rotVel 
-    print(f"Horizontal slider value: {newVal}", rotVel  )
-
-def stopButtonPressed(ui, id):
-    print("stopping")
-
-def rotButtonPressed(ui, id):
-    print("rot vel is 0")
-    
-def sysCall_actuation():
-    # L/2 é o raio do robô, então a velocidade de cada roda é calculada com base na velocidade linear e angular desejada.
-    rightVel = linVel + L/2 * rotVel
-    leftVel  = linVel - L/2 * rotVel
-
-    print (rightVel,leftVel)
-    sim.setJointTargetVelocity(self.rightMotorHandle,-rightVel/wheelradius)
-    sim.setJointTargetVelocity(self.leftMotorHandle, -leftVel /wheelradius)
-    state,dist,nil,nil,nil=sim.readProximitySensor(self.proximitySensorHandle)
-    # print(state,dist)
-    # Check if any key was pressed
-    _, keys, _ = sim.getSimulatorMessage()
-    key=chr(keys[0])
-
-    if key == 'w':
-        print("Key pressed:", key)
-    pass
+    print("Simulação iniciada. Navegação autônoma por APF ativa!")
 
 def sysCall_sensing():
-    # put your sensing code here
+    global L, max_linVel, max_rotVel, wheelradius
+
+    # 1. Leitura da Posição e Orientação do Robô no espaço 2D
+    robot_pos_3d = sim.getObjectPosition(self.robotHandle, -1)
+    robot_ori_3d = sim.getObjectOrientation(self.robotHandle, -1)
+    
+    q_robot = np.array([robot_pos_3d[0], robot_pos_3d[1]])
+    theta_robot = robot_ori_3d[2] # Gamma (-pi a +pi)
+
+    # 2. Obstáculos conhecidos + Leitura dinâmica pelo Sensor de Proximidade
+    current_obstacles = list(q_obstacles)
+    state, dist, detectedPoint, _, _ = sim.readProximitySensor(self.proximitySensorHandle)
+    if state == 1:
+        matrix = sim.getObjectMatrix(self.proximitySensorHandle, -1)
+        sensor_obs_x = matrix[3] + detectedPoint[0]
+        sensor_obs_y = matrix[7] + detectedPoint[1]
+        current_obstacles.append(np.array([sensor_obs_x, sensor_obs_y]))
+
+    # 3. Cálculo da distância ao Objetivo
+    dist_to_goal = np.linalg.norm(q_robot - q_goal)
+    
+    if dist_to_goal > 0.15: # Raio de parada no destino
+        f = compute_forces(q_robot, q_goal, current_obstacles)
+
+        # Compensação de 180° no ângulo caso o referencial do robô esteja invertido
+        theta_des = math.atan2(f[1], f[0]) + math.pi
+
+        # Normalização do erro no intervalo [-pi, pi] para lidar com o limite [-180°, 180°]
+        e_theta = math.atan2(math.sin(theta_des - theta_robot), math.cos(theta_des - theta_robot))
+        f_norm = np.linalg.norm(f)
+
+        # Controlador P para velocidade angular e ajuste de velocidade linear
+        rotVel = Kp * e_theta
+        linVel = max_linVel * max(0.0, math.cos(e_theta)) * math.tanh(f_norm)
+    else:
+        linVel = 0.0
+        rotVel = 0.0
+
+    # 4. Cinemática Inversa e Aplicação nas Rodas
+    rightVel = linVel + (L / 2.0) * rotVel
+    leftVel  = linVel - (L / 2.0) * rotVel
+
+    sim.setJointTargetVelocity(self.rightMotorHandle, rightVel / wheelradius)
+    sim.setJointTargetVelocity(self.leftMotorHandle, leftVel / wheelradius)
+
+def sysCall_actuation():
     pass
 
 def sysCall_cleanup():
-    simUI.destroy(ui)
-    pass
-
-
-
+    """ Limpeza dos objetos da cena ao encerrar a simulação """
+    try:
+        for handle in self.spawned_objects:
+            sim.removeObject(handle)
+    except:
+        pass
