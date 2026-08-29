@@ -9,7 +9,7 @@ Kp = 1.2
 q_goal = np.array([1.0, -2.0])
 q_obstacles = [np.array([0.4, -0.8]), np.array([0.7, -1.4])]
 
-def create_cylinder(sim, pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], alias="Cylinder"):
+def create_cylinder(sim, pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], alias="Cylinder", is_detectable=True):
     """ Cria cilindros 3D dinamicamente na cena durante a simulação """
     try:
         sizes = [radius * 2, radius * 2, height]
@@ -27,8 +27,15 @@ def create_cylinder(sim, pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], al
             except:
                 pass
 
+        # Propriedades físicas básicas
         sim.setObjectInt32Param(shape_handle, sim.shapeintparam_static, 1)
         sim.setObjectInt32Param(shape_handle, sim.shapeintparam_respondable, 1)
+
+        # Define se o objeto é detectável pelo sensor de proximidade
+        if is_detectable:
+            sim.setObjectInt32Param(shape_handle, sim.entityintparam_detectable, 1)
+        else:
+            sim.setObjectInt32Param(shape_handle, sim.entityintparam_detectable, 0)
 
         return shape_handle
     except Exception as e:
@@ -46,9 +53,9 @@ def compute_forces(q, q_goal, q_obstacles):
     # 2. Força Repulsiva (do obstáculo para o robô)
     f_repulsive = []
     for q_obs in q_obstacles:
-        dist = np.linalg.norm(q - [q_obs[1], q_obs[0]])
+        dist = np.linalg.norm(q - q_obs)
         if dist <= d_safe and dist > 0.01:
-            f_rep = k_repulsive * (1.0 / dist - 1.0 / d_safe) * ((q - [q_obs[1], q_obs[0]]) / (dist ** 2))
+            f_rep = k_repulsive * (1.0 / dist - 1.0 / d_safe) * ((q - q_obs) / (dist ** 2))
             f_repulsive.append(f_rep)
 
     if len(f_repulsive) > 0:
@@ -76,17 +83,18 @@ def sysCall_init():
 
     self.spawned_objects = []
 
-    # Criar Objetivo (Verde) e Obstáculos (Vermelhos) na cena
-    goal_handle = create_cylinder(sim, q_goal, radius=0.1, height=0.4, color=[0.0, 1.0, 0.0], alias="Goal_Cylinder")
+    # Criar Objetivo (Verde) -> NÃO DETECTÁVEL (is_detectable=False)
+    goal_handle = create_cylinder(sim, q_goal, radius=0.1, height=0.4, color=[0.0, 1.0, 0.0], alias="Goal_Cylinder", is_detectable=False)
     if goal_handle:
         self.spawned_objects.append(goal_handle)
 
+    # Criar Obstáculos (Vermelhos) -> DETECTÁVEIS (is_detectable=True)
     for i, obs_pos in enumerate(q_obstacles):
-        obs_handle = create_cylinder(sim, obs_pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], alias=f"Obstacle_Cylinder_{i}")
+        obs_handle = create_cylinder(sim, obs_pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], alias=f"Obstacle_Cylinder_{i}", is_detectable=True)
         if obs_handle:
             self.spawned_objects.append(obs_handle)
 
-    print("Simulação iniciada. Navegação autônoma por APF ativa!")
+    print("Simulação iniciada. Objetos criados! (Obstáculos detectáveis ativados)")
 
 def sysCall_sensing():
     global L, max_linVel, max_rotVel, wheelradius
@@ -101,7 +109,7 @@ def sysCall_sensing():
     # 2. Obstáculos conhecidos + Leitura dinâmica pelo Sensor de Proximidade
     current_obstacles = list(q_obstacles)  # Copia os obstáculos conhecidos
     state, dist, detectedPoint, _, _ = sim.readProximitySensor(self.proximitySensorHandle)
-    print(f"Sensor de Proximidade: Estado={state}, Distância={dist}, Ponto Detectado={detectedPoint}")
+    
     if state == 1:
         matrix = sim.getObjectMatrix(self.proximitySensorHandle, -1)
         sensor_obs_x = matrix[3] + detectedPoint[0]
@@ -117,7 +125,7 @@ def sysCall_sensing():
         # Compensação de 180° no ângulo caso o referencial do robô esteja invertido
         theta_des = math.atan2(f[1], f[0]) + math.pi
 
-        # Normalização do erro no intervalo [-pi, pi] para lidar com o limite [-180°, 180°]
+        # Normalização do erro no intervalo [-pi, pi]
         e_theta = math.atan2(math.sin(theta_des - theta_robot), math.cos(theta_des - theta_robot))
         f_norm = np.linalg.norm(f)
 
