@@ -46,9 +46,9 @@ def compute_forces(q, q_goal, q_obstacles):
     # 2. Força Repulsiva (do obstáculo para o robô)
     f_repulsive = []
     for q_obs in q_obstacles:
-        dist = np.linalg.norm(q - q_obs)
+        dist = np.linalg.norm(q - [q_obs[1], q_obs[0]])
         if dist <= d_safe and dist > 0.01:
-            f_rep = k_repulsive * (1.0 / dist - 1.0 / d_safe) * ((q - q_obs) / (dist ** 2))
+            f_rep = k_repulsive * (1.0 / dist - 1.0 / d_safe) * ((q - [q_obs[1], q_obs[0]]) / (dist ** 2))
             f_repulsive.append(f_rep)
 
     if len(f_repulsive) > 0:
@@ -99,8 +99,9 @@ def sysCall_sensing():
     theta_robot = robot_ori_3d[2] # Gamma (-pi a +pi)
 
     # 2. Obstáculos conhecidos + Leitura dinâmica pelo Sensor de Proximidade
-    current_obstacles = list(q_obstacles)
+    current_obstacles = list(q_obstacles)  # Copia os obstáculos conhecidos
     state, dist, detectedPoint, _, _ = sim.readProximitySensor(self.proximitySensorHandle)
+    print(f"Sensor de Proximidade: Estado={state}, Distância={dist}, Ponto Detectado={detectedPoint}")
     if state == 1:
         matrix = sim.getObjectMatrix(self.proximitySensorHandle, -1)
         sensor_obs_x = matrix[3] + detectedPoint[0]
