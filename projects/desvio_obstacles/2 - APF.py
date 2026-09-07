@@ -8,8 +8,7 @@ rad2deg = 180.0 / math.pi
 Kp = 1.2
 q_goal = np.array([1.0, -2.0])
 
-# Posições reais dos obstáculos: usadas APENAS para criar os cilindros na cena.
-# O robô não conhece nenhuma delas ? ele as descobre com o sensor.
+# Posições reais dos obstáculos
 q_obstacles = [np.array([0.4, -1.1]), np.array([0.8, -1.7])]
 
 DEBUG = True
@@ -47,11 +46,14 @@ def create_cylinder(sim, pos, radius=0.15, height=0.3, color=[1.0, 0.0, 0.0], al
 
     # Define se o cilindro existe ou não para o sensor de proximidade
     try:
-        props = (sim.objectspecialproperty_collidable
-                 | sim.objectspecialproperty_measurable
-                 | sim.objectspecialproperty_renderable)
+        props = (
+            sim.objectspecialproperty_collidable
+            | sim.objectspecialproperty_measurable
+            | sim.objectspecialproperty_renderable
+        )
         if detectable:
             props |= sim.objectspecialproperty_detectable
+
         sim.setObjectSpecialProperty(shape_handle, props)
     except Exception as e:
         print(f"Aviso: não foi possível ajustar a detectabilidade de {alias}: {e}")
