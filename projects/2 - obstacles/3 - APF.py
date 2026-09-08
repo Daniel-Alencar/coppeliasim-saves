@@ -8,7 +8,8 @@ rad2deg = 180.0 / math.pi
 Kp = 1.2
 K_ATTRACTIVE = 1.0
 K_REPULSIVE = 3.5
-D_SAFE = 1.0                  # raio de influência de cada obstáculo
+# raio de influência de cada obstáculo
+D_SAFE = 1.0                  
 
 DEBUG = True
 
@@ -17,10 +18,12 @@ OBSTACLE_MERGE_DIST = 0.25
 
 # --- Geração aleatória do cenário -------------------------------------------
 # Objetivo e obstáculos caem em posições novas a cada execução da simulação.
-RANDOM_SEED = None            # troque por um inteiro para repetir um cenário
+# troque por um inteiro para repetir um cenário
+RANDOM_SEED = None            
 N_OBSTACLES = 15
 
-ARENA_MIN = np.array([-2.0, -2.0])   # limites (x, y) do sorteio
+# limites (x, y) do sorteio
+ARENA_MIN = np.array([-2.0, -2.0])  
 ARENA_MAX = np.array([2.0, 2.0])
 
 OBSTACLE_RADIUS = 0.15
