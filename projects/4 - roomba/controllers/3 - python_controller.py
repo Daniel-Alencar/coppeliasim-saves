@@ -50,6 +50,13 @@ TURN_EXTRA   = 0.30          # tempo com a frente livre para encerrar o giro [s]
 TURN_TIMEOUT = 4.0           # teto do giro, evita girar para sempre [s]
 
 # Zigue-zague lento no cruzeiro: quebra trajetórias retas que se repetem.
+# Há um trade-off medido aqui (24 execuções de 300 s num simulador cinemático,
+# sala de 5x5 m com 4 obstáculos), entre cobertura e encostar na parede:
+#     amplitude 0.25 -> cobertura 81%, 2.3% dos passos barrados pela parede
+#     amplitude 0.15 -> cobertura 79%, 0.2%
+#     amplitude 0.00 -> cobertura 77%, 0.1%
+# Nenhum valor domina os outros. 0.25 privilegia cobertura, que é o objetivo
+# de um robô limpador; baixe para 0.15 se encostar na parede for um problema.
 WANDER_RATE   = 0.25         # amplitude [rad/s]
 WANDER_PERIOD = 3.0          # período [s]
 
