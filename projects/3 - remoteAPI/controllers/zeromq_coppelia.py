@@ -25,10 +25,13 @@ Use /usr/bin/python3: o python do Anaconda não consegue importar o rclpy.
 """
 
 import math
+import signal
+import threading
 import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import JointState, Range
 
@@ -65,6 +68,7 @@ class CoppeliaBridge(Node):
         self.leftMotorHandle = self.find(f'{robot}/leftMotor')
         self.rightMotorHandle = self.find(f'{robot}/rightMotor')
         self.sensorNariz = self.find(f'{robot}/proximitySensor')
+        self.warn_enabled_scripts(robot)
 
         self.wheel_separation = self.get_parameter('wheel_separation').value
         if self.wheel_separation <= 0.0:
@@ -82,6 +86,10 @@ class CoppeliaBridge(Node):
         )
         if self.started_here:
             self.sim.startSimulation()
+        elif self.sim.getSimulationState() == self.sim.simulation_paused:
+            self.get_logger().warn(
+                'a simulação está pausada: os motores só respondem depois do play.'
+            )
 
         self.velocity = (0.0, 0.0)
         self.deadline = 0.0
@@ -127,6 +135,18 @@ class CoppeliaBridge(Node):
                 '  /usr/bin/python3 zeromq_coppelia.py --ros-args -p robot:=/meuRobo'
             )
 
+    def warn_enabled_scripts(self, robot):
+        """Avisa sobre child scripts do robô que ainda disputam os motores."""
+        scripts = self.sim.getObjectsInTree(
+            self.sim.getObject(robot), self.sim.sceneobject_script
+        )
+        for h in scripts:
+            if not self.sim.getBoolProperty(h, 'scriptDisabled'):
+                self.get_logger().warn(
+                    f'o script {self.sim.getObjectAlias(h, 2)} está habilitado e '
+                    'sobrescreve os comandos do teleop. Desabilite-o na cena.'
+                )
+
     def measure_wheel_separation(self):
         """Distância entre os dois motores, lida direto da cena."""
         left = self.sim.getObjectPosition(self.leftMotorHandle, self.sim.handle_world)
@@ -150,10 +170,6 @@ class CoppeliaBridge(Node):
         self.deadline = time.monotonic() + self.cmd_timeout
 
     def step(self):
-        # Durante o encerramento o contexto já pode ter sido destruído.
-        if not rclpy.ok():
-            return
-
         # Sem comando recente o robô para sozinho, mesmo que o teleop caia.
         if time.monotonic() >= self.deadline:
             self.velocity = (0.0, 0.0)
@@ -196,7 +212,14 @@ class CoppeliaBridge(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    # O Ctrl+C só levanta uma flag. Deixar o rclpy ou o KeyboardInterrupt cortarem
+    # o laço no meio de uma chamada ZeroMQ invalida o socket e o contexto, e aí o
+    # comando de parada dos motores nunca chega ao simulador.
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    stop_requested = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop_requested.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop_requested.set())
+
     try:
         node = CoppeliaBridge()
     except SystemExit as erro:
@@ -204,14 +227,12 @@ def main(args=None):
         rclpy.shutdown()
         return 1
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+        while not stop_requested.is_set():
+            rclpy.spin_once(node, timeout_sec=0.1)
     finally:
         node.stop()
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
     return 0
 
 
