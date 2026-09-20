@@ -58,7 +58,7 @@ rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install
 
 # 3. "entra" no workspace: coloca os pacotes no PATH/PYTHONPATH da shell
-source install/setup.bash
+source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
 
 # 4. roda
 ros2 launch car_control car_control.launch.py
@@ -66,9 +66,15 @@ ros2 launch car_control car_control.launch.py
 
 Dois detalhes que economizam horas:
 
-- **`source install/setup.bash` vale só para aquela shell.** Toda aba nova de
-  terminal precisa repetir. O `setup.bash` do workspace já encadeia o do ROS
-  (`/opt/ros/<distro>/setup.bash`), chamado de *underlay*.
+- **Use a variante da sua shell.** O colcon gera `setup.bash`, `setup.zsh` e
+  `setup.sh`. Sourcear o `.bash` a partir do zsh **falha em silêncio parcial**:
+  o script descobre a própria pasta por `$BASH_SOURCE`, que o zsh não define, e
+  acaba procurando os arquivos no diretório atual. O sintoma é
+  `no such file or directory: .../ros2_ws/local_setup.sh` seguido de
+  `Package 'x' not found`.
+- **`source install/setup.zsh` vale só para aquela shell.** Toda aba nova de
+  terminal precisa repetir. O `setup` do workspace já encadeia o do ROS
+  (`/opt/ros/<distro>/setup.zsh`), chamado de *underlay*.
 - **`--symlink-install`** faz `install/` apontar para os arquivos em `src/` por
   link simbólico em vez de copiar. Com isso, editar um `.py` já vale na próxima
   execução, sem recompilar. Mudanças em `setup.py`, `package.xml` ou em
@@ -289,6 +295,7 @@ colcon build --packages-up-to car_control
 
 # inspecionar o que está rodando
 ros2 pkg list                  # pacotes visíveis na shell atual
+ros2 pkg executables meu_pacote  # executáveis que o pacote oferece
 ros2 node list                 # nós ativos
 ros2 topic list                # tópicos
 ros2 topic echo /car_control/my_robot/left_motor
@@ -307,7 +314,9 @@ ros2 launch car_control car_control.launch.py
 
 | Sintoma | Causa provável |
 |---|---|
-| `Package 'x' not found` | faltou `source install/setup.bash` nesta shell, ou o build falhou |
+| `Package 'x' not found` | faltou sourcear `install/setup.<sua shell>` nesta shell, ou o build falhou |
+| `no such file or directory: .../ros2_ws/local_setup.sh` | sourceou `setup.bash` no zsh — use `setup.zsh` |
+| `not found: ".../install/<pacote>/share/.../local_setup.bash"` | install antigo apontando para um caminho que não existe mais (workspace movido) — apague `build/ install/` e recompile |
 | `ros2 launch` não acha o arquivo | `launch/` não está no `data_files` do `setup.py` |
 | `No executable found` | falta a entrada em `console_scripts`, ou o `setup.cfg` não aponta para `lib/<pacote>` |
 | Editei o `.py` e nada mudou | build sem `--symlink-install`, ou alteração em `setup.py`/`package.xml` (aí recompile) |
@@ -322,3 +331,6 @@ ros2 launch car_control car_control.launch.py
 instalar em `setup.py`/`CMakeLists.txt`; `colcon build` transforma isso em
 `install/`; `source install/setup.bash` torna esse resultado visível para a
 shell; e `ros2 run`/`ros2 launch` sobem os nós que conversam por tópicos.
+
+> Detalhe que custa tempo: `install/` e `build/` guardam **caminhos absolutos**.
+> Mover ou renomear a pasta do workspace invalida os dois — apague e recompile.
