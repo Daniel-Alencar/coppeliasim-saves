@@ -23,12 +23,6 @@ por um `MultiThreadedExecutor`:
 | `car_node` | Assina `turtle1/cmd_vel` e aplica a cinemática inversa do robô diferencial |
 | `motor_publisher_node` | Publica, a 20 Hz, a velocidade de cada roda em `std_msgs/Float32` (rad/s) |
 
-> **Comparação com [diff_robot](../diff_robot/README.md):** aquele pacote fala
-> com o simulador pela ZeroMQ Remote API, sem plugin nem script. Este exige o
-> plugin `simROS2` e um script na cena, mas em troca o robô fica sendo um
-> participante do grafo ROS por conta própria. **Não use os dois ao mesmo tempo
-> no mesmo robô** — eles disputam os motores.
-
 ---
 
 ## 1. Pré-requisitos
@@ -46,8 +40,8 @@ O plugin só é carregado se o ambiente ROS estiver na shell que abre o
 simulador. Abrir pelo ícone do sistema **não** funciona:
 
 ```bash
+source /opt/ros/jazzy/setup.bash
 source /opt/ros/jazzy/setup.zsh
-source ~/caminho/para/ros2_ws/install/setup.zsh
 ./coppeliaSim.sh
 ```
 
@@ -74,7 +68,8 @@ Os nomes estão fixos no script: se você rodar o nó **sem** o namespace
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select car_control --symlink-install
-source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
+source install/setup.bash
+source install/setup.zsh
 ```
 
 No zsh, sourcear `setup.bash` não funciona: o script não descobre a própria
@@ -85,22 +80,6 @@ Confira:
 ```bash
 ros2 pkg executables car_control    # car_control car_control
 ```
-
-### O plugin `simROS2`
-
-O `install/sim_ros2_interface` deste workspace está **quebrado**: foi compilado
-quando a pasta tinha outro caminho e os links apontam para um diretório que não
-existe mais. Reconstrua antes de usar este pacote:
-
-```bash
-cd ros2/ros2_ws
-rm -rf build/sim_ros2_interface install/sim_ros2_interface
-colcon build --packages-select sim_ros2_interface
-source install/setup.zsh
-```
-
-> Vale a regra geral: `build/` e `install/` guardam caminhos absolutos. Mover
-> ou renomear a pasta do workspace invalida os dois.
 
 ---
 
@@ -118,6 +97,7 @@ ros2 launch car_control car_control.launch.py
 **Terminal 2 — o teclado:**
 
 ```bash
+source /opt/ros/jazzy/setup.bash
 source /opt/ros/jazzy/setup.zsh
 ros2 run turtlesim turtle_teleop_key --ros-args -r __ns:=/car_control
 ```
@@ -222,8 +202,3 @@ ros2 run car_control car_control --ros-args -r __ns:=/car_control \
 | `Package 'car_control' not found` | Faltou sourcear o workspace nesta shell — e, no zsh, tem que ser `install/setup.zsh` |
 | `no such file or directory: .../ros2_ws/local_setup.sh` | `setup.bash` sourceado a partir do zsh |
 | `not found: ".../install/sim_ros2_interface/.../local_setup.zsh"` | Install do plugin herdado de outro caminho; reconstrua (seção 2) |
-
----
-
-Ver também: [diff_robot](../diff_robot/README.md) (mesma tarefa pela ZeroMQ
-Remote API) e [ESTRUTURA_ROS2.md](../../../ESTRUTURA_ROS2.md).
