@@ -1,92 +1,102 @@
-"""Ponte ROS 2 <-> CoppeliaSim para o robô diferencial /myRobot.
+"""Ponte ROS 2 <-> CoppeliaSim para o docking do /myRobot.
 
-Assina cmd_vel (geometry_msgs/Twist), converte a velocidade do corpo em
-velocidades de roda e aplica nos motores pela ZeroMQ Remote API. Publica de
-volta joint_states e proximity.
+Expõe pelo ROS 2 tudo o que um controlador de docking externo precisa, lendo e
+escrevendo os sinais da cena pela ZeroMQ Remote API:
 
-Os tópicos são relativos: com o namespace diff_robot definido no launch eles
-viram /diff_robot/cmd_vel, /diff_robot/joint_states e /diff_robot/proximity.
+    CoppeliaSim                              ROS 2 (namespace myRobot)
+    <handle>Battery        (float)  --->     battery                       BatteryState
+    <handle>Charging       (int)    --->     charging                      std_msgs/Bool
+    <handle>signalStrength (float)  --->     charging_base/strengthSignal  std_msgs/Float32
+    <handle>relativeAngle  (float)  --->     charging_base/relativeAngle   std_msgs/Float32
+    <handle>Docking        (int)    <---     docking                       std_msgs/Bool
+    leftMotor / rightMotor (juntas) <---     cmd_vel                       geometry_msgs/Twist
 
-Fluxo de dados:
+<handle> é o handle inteiro do robô na cena, por exemplo 84Battery.
 
-    dummy_driver / teleop --(cmd_vel)--> esta ponte --(ZeroMQ)--> CoppeliaSim
-    CoppeliaSim --(ZeroMQ)--> esta ponte --(joint_states, proximity)--> ROS 2
+Os tópicos são relativos: com o namespace myRobot do launch viram
+/myRobot/battery, /myRobot/cmd_vel etc.
+
+Esta ponte não implementa o docking autônomo: só a comunicação.
 """
 
-import math        # math.dist: distância entre os dois motores
+import math        # math.dist, math.nan
 import signal      # tratamento manual do Ctrl+C (SIGINT) e do SIGTERM
 import threading   # threading.Event: flag de parada segura entre sinal e laço
 import time        # time.monotonic: relógio que nunca volta, ideal para prazos
 
-import rclpy                                    # biblioteca cliente do ROS 2 em Python
-from rclpy.node import Node                     # classe base de todo nó ROS 2
-from rclpy.signals import SignalHandlerOptions  # permite desligar o Ctrl+C do rclpy
-from geometry_msgs.msg import Twist             # comando de velocidade linear/angular
-from sensor_msgs.msg import JointState, Range   # estado das juntas e leitura de distância
-
-# Coppelia ZeroMQ Remote API: permite chamar as funções sim.* do CoppeliaSim a
-# partir de um processo externo, pela porta TCP 23000.
+# Coppelia ZeroMQ Remote API: chama as funções sim.* a partir de outro processo.
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+from geometry_msgs.msg import Twist
+import rclpy
+from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+from sensor_msgs.msg import BatteryState
+from std_msgs.msg import Bool, Float32
+
+# Nomes dos sinais do beacon, na ordem em que são procurados. O primeiro par é o
+# do enunciado; o segundo é o que o script /chargingBase/beacon da cena
+# "Evaluation scene3.2_students.ttt" escreve quando recebe o sinal "Beacon".
+BEACON_SIGNALS = [
+    ('signalStrength', 'relativeAngle'),
+    ('StrengthSignal', 'RelativeAngle'),
+]
 
 
-class CoppeliaBridge(Node):
-    """Nó ROS 2 que traduz comandos de velocidade em comandos de motor no CoppeliaSim."""
+class DockingBridge(Node):
+    """Nó ROS 2 que liga os sinais de docking do CoppeliaSim a tópicos ROS."""
 
     def __init__(self):
-        # Registra o nó no ROS com o nome coppelia_bridge (é o nome que aparece
-        # em `ros2 node list`).
-        super().__init__('coppelia_bridge')
+        super().__init__('remoteAPI_ROS2_bridge')
 
         # --- Parâmetros ------------------------------------------------------
-        # Parâmetros ROS podem ser trocados na linha de comando sem editar o
-        # código, por exemplo: --ros-args -p cmd_timeout:=1.0
-        self.declare_parameter('robot', '/myRobot')     # caminho do robô na cena
-        self.declare_parameter('wheel_radius', 0.05)    # raio da roda, em metros
+        self.declare_parameter('host', 'localhost')      # onde está o CoppeliaSim
+        self.declare_parameter('port', 23000)            # porta da ZeroMQ Remote API
+        self.declare_parameter('robot', '/myRobot')      # caminho do robô na cena
+        self.declare_parameter('wheel_radius', 0.05)     # raio da roda, em metros
         # 0.0 = medir a distância entre as rodas na própria cena.
         self.declare_parameter('wheel_separation', 0.0)
+        # Nesta cena as juntas estão montadas de modo que velocidade negativa
+        # faz o robô andar para a frente (o python_controler da cena usa -vel/r).
+        self.declare_parameter('motor_sign', -1.0)
         self.declare_parameter('max_wheel_speed', 10.0)  # limite por roda, em rad/s
-        # Multiplicam o Twist recebido. 1.0 = comando já em m/s e rad/s; para o
-        # turtle_teleop_key (2.0 fixo) use 0.15 e 0.75.
-        self.declare_parameter('linear_scale', 1.0)
-        self.declare_parameter('angular_scale', 1.0)
-        self.declare_parameter('sensor_range', 1.0)     # alcance do sensor, em metros
-        self.declare_parameter('cmd_timeout', 0.5)      # segundos até parar sem comando
-        self.declare_parameter('rate', 20.0)            # frequência do laço step(), em Hz
-        self.declare_parameter('autostart', True)       # dar play se a simulação estiver parada
+        self.declare_parameter('cmd_timeout', 0.5)       # segundos até parar sem comando
+        # Segundos sem leitura nova do beacon até considerar que o sinal sumiu.
+        self.declare_parameter('beacon_timeout', 0.5)
+        # Com a bateria em 0 % o robô não anda, como fazia o python_controler.
+        self.declare_parameter('stop_when_battery_empty', True)
+        self.declare_parameter('rate', 20.0)             # frequência do laço step(), em Hz
+        self.declare_parameter('autostart', True)        # dar play se a simulação estiver parada
 
-        # Lê os valores finais: o padrão acima ou o que veio na linha de comando.
+        host = self.get_parameter('host').value
+        port = self.get_parameter('port').value
         robot = self.get_parameter('robot').value
         self.wheel_radius = self.get_parameter('wheel_radius').value
+        self.motor_sign = self.get_parameter('motor_sign').value
         self.max_wheel_speed = self.get_parameter('max_wheel_speed').value
-        self.linear_scale = self.get_parameter('linear_scale').value
-        self.angular_scale = self.get_parameter('angular_scale').value
         self.cmd_timeout = self.get_parameter('cmd_timeout').value
+        self.beacon_timeout = self.get_parameter('beacon_timeout').value
+        self.stop_when_battery_empty = self.get_parameter('stop_when_battery_empty').value
 
         # --- Conexão com o CoppeliaSim ---------------------------------------
-        # Handles são identificadores inteiros dos objetos da cena. Toda chamada
-        # sim.* que age sobre um objeto recebe o handle dele.
-        self.sim = self.connect()
+        self.sim = self.connect(host, port)
+        self.robotHandle = self.find(robot)
         self.leftMotorHandle = self.find(f'{robot}/leftMotor')
         self.rightMotorHandle = self.find(f'{robot}/rightMotor')
-        self.sensorNariz = self.find(f'{robot}/proximitySensor')
-        self.warn_enabled_scripts(robot)
+        # Os sinais do robô são nomeados com o handle dele na frente, por
+        # exemplo "84Battery". str() do handle é exatamente esse prefixo.
+        self.prefix = str(self.robotHandle)
+        self.warn_motor_scripts(robot)
 
-        # --- Geometria do robô -----------------------------------------------
-        # A distância entre as rodas é necessária para a cinemática do giro.
         self.wheel_separation = self.get_parameter('wheel_separation').value
         if self.wheel_separation <= 0.0:
             self.wheel_separation = self.measure_wheel_separation()
         self.get_logger().info(
-            f'raio da roda: {self.wheel_radius:.3f} m | '
-            f'distância entre rodas: {self.wheel_separation:.3f} m'
+            f'robô {robot} (handle {self.robotHandle}) | raio da roda: '
+            f'{self.wheel_radius:.3f} m | distância entre rodas: '
+            f'{self.wheel_separation:.3f} m'
         )
 
-        self.range_max = self.get_parameter('sensor_range').value
-
         # --- Estado da simulação ---------------------------------------------
-        # started_here lembra se foi esta ponte que deu o play. Só nesse caso
-        # ela para a simulação ao sair, para não interromper uma simulação que
-        # o usuário iniciou.
         self.started_here = (
             self.get_parameter('autostart').value
             and self.sim.getSimulationState() == self.sim.simulation_stopped
@@ -95,165 +105,224 @@ class CoppeliaBridge(Node):
             self.sim.startSimulation()
         elif self.sim.getSimulationState() == self.sim.simulation_paused:
             self.get_logger().warn(
-                'a simulação está pausada: os motores só respondem depois do play.'
+                'a simulação está pausada: nada muda até o play.'
             )
 
-        # --- Estado do comando -----------------------------------------------
-        # velocity: última velocidade pedida para (roda esquerda, roda direita), em rad/s.
-        # deadline: instante, em time.monotonic(), em que esse comando expira.
-        self.velocity = (0.0, 0.0)
-        self.deadline = 0.0
+        # --- Estado interno --------------------------------------------------
+        self.velocity = (0.0, 0.0)     # (esquerda, direita) em rad/s, já sem o motor_sign
+        self.deadline = 0.0            # instante em que o último cmd_vel expira
+        self.last_battery = None       # nível anterior, para saber se sobe ou desce
+        self.charging = False          # último estado de carga conhecido
+        self.beacon = (0.0, math.nan)  # (força, ângulo) da última leitura válida
+        self.beacon_time = -math.inf   # instante dessa leitura
+        self.battery_empty_warned = False
 
         # --- Comunicação ROS -------------------------------------------------
-        # Assinatura: cada Twist publicado em cmd_vel chama cmd_vel_callback.
-        # Sem a barra inicial o tópico herda o namespace do nó. O 10 é a
-        # profundidade da fila de mensagens (QoS).
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
-        # Publicadores: devolvem ao ROS as leituras dos motores e do sensor.
-        self.joint_pub = self.create_publisher(JointState, 'joint_states', 10)
-        self.range_pub = self.create_publisher(Range, 'proximity', 10)
+        self.create_subscription(Bool, 'docking', self.docking_callback, 10)
+        self.battery_pub = self.create_publisher(BatteryState, 'battery', 10)
+        self.charging_pub = self.create_publisher(Bool, 'charging', 10)
+        self.strength_pub = self.create_publisher(Float32, 'charging_base/strengthSignal', 10)
+        self.angle_pub = self.create_publisher(Float32, 'charging_base/relativeAngle', 10)
 
-        # Timer: chama step() a cada 1/rate segundos (50 ms com rate = 20). É o
-        # step() que conversa com o simulador; o callback só guarda o comando.
         self.create_timer(1.0 / self.get_parameter('rate').value, self.step)
         self.get_logger().info(
-            f'ponte pronta. aguardando comandos em {self.resolve_topic_name("cmd_vel")}'
+            f'ponte pronta. comandos em {self.resolve_topic_name("cmd_vel")} e '
+            f'{self.resolve_topic_name("docking")}'
         )
 
-    def connect(self):
+    # =========================================================================
+    #  Conexão e cena
+    # =========================================================================
+
+    def connect(self, host, port):
         """Conecta ao CoppeliaSim, explicando o motivo quando não dá."""
         try:
-            # RemoteAPIClient() conecta em localhost:23000. getObject('sim')
-            # devolve um objeto com as mesmas funções sim.* dos scripts da cena.
-            self.client = RemoteAPIClient()
-            return self.client.getObject('sim')
+            self.client = RemoteAPIClient(host, port)
+            return self.client.require('sim')
         except Exception:
-            # SystemExit é capturado em main(), que mostra a mensagem e encerra.
             raise SystemExit(
-                'Não consegui falar com o CoppeliaSim na porta 23000.\n'
-                '  - O simulador está aberto?\n'
-                '  - Ele responde? Um child script da cena preso em laço (por exemplo\n'
-                '    um controlador em Python com curses, ou que abre um RemoteAPIClient\n'
-                '    para o próprio simulador) trava a thread principal: a porta continua\n'
-                '    aberta, mas nenhuma chamada é respondida. O log da cena mostra\n'
-                '    "script execution was terminated externally" quando é esse o caso.\n'
-                '    Pare a simulação e desabilite esse script.'
+                f'Não consegui falar com o CoppeliaSim em {host}:{port}.\n'
+                '  - O simulador está aberto, com a cena de docking?\n'
+                '  - Ele responde? Um child script da cena preso em laço trava a\n'
+                '    thread principal: a porta continua aberta, mas nenhuma chamada\n'
+                '    é respondida. Pare a simulação e desabilite esse script.'
             )
 
     def find(self, path):
         """Busca um objeto e, se não achar, mostra o que existe na cena."""
-        try:
-            return self.sim.getObject(path)
-        except Exception:
-            # Lista o caminho de todos os objetos da cena para ajudar a achar o
-            # nome certo. O 2 em getObjectAlias pede o caminho completo.
-            existentes = [
-                self.sim.getObjectAlias(h, 2)
-                for h in self.sim.getObjectsInTree(self.sim.handle_scene)
-            ]
-            raise SystemExit(
-                f'Objeto "{path}" não existe na cena aberta.\n'
-                'Objetos disponíveis:\n  '
-                + '\n  '.join(existentes)
-                + '\nAjuste o parâmetro robot, por exemplo:\n'
-                '  ros2 launch diff_robot diff_robot.launch.py robot:=/meuRobo'
-            )
+        handle = self.sim.getObject(path, {'noError': True})
+        if handle != -1:
+            return handle
+        existentes = [
+            self.sim.getObjectAlias(h, 2)
+            for h in self.sim.getObjectsInTree(self.sim.handle_scene)
+        ]
+        raise SystemExit(
+            f'Objeto "{path}" não existe na cena aberta.\n'
+            'Objetos disponíveis:\n  '
+            + '\n  '.join(existentes)
+            + '\nAjuste o parâmetro robot, por exemplo:\n'
+            '  ros2 launch robot_docking robot_docking.launch.py robot:=/meuRobo'
+        )
 
-    def warn_enabled_scripts(self, robot):
-        """Avisa sobre child scripts do robô que ainda disputam os motores."""
-        # Todos os objetos do tipo script pendurados na árvore do robô.
+    def warn_motor_scripts(self, robot):
+        """Avisa sobre scripts do robô que também escrevem nos motores.
+
+        Só esses disputam o controle com a ponte. Os demais (bateria,
+        odometria, encoders, sensor de docking) precisam continuar habilitados.
+        """
         scripts = self.sim.getObjectsInTree(
             self.sim.getObject(robot), self.sim.sceneobject_script
         )
         for h in scripts:
-            if not self.sim.getBoolProperty(h, 'scriptDisabled'):
+            if self.sim.getBoolProperty(h, 'scriptDisabled'):
+                continue
+            if 'setJointTargetVelocity' in self.sim.getStringProperty(h, 'code'):
                 self.get_logger().warn(
                     f'o script {self.sim.getObjectAlias(h, 2)} está habilitado e '
-                    'sobrescreve os comandos do teleop. Desabilite-o na cena.'
+                    'escreve nos motores a cada passo, sobrescrevendo o cmd_vel. '
+                    'Desabilite-o na cena.'
                 )
 
     def measure_wheel_separation(self):
         """Distância entre os dois motores, lida direto da cena."""
-        # Posições (x, y, z) dos motores no referencial do mundo.
         left = self.sim.getObjectPosition(self.leftMotorHandle, self.sim.handle_world)
         right = self.sim.getObjectPosition(self.rightMotorHandle, self.sim.handle_world)
         return math.dist(left, right)
 
+    # =========================================================================
+    #  ROS -> CoppeliaSim
+    # =========================================================================
+
     def cmd_vel_callback(self, msg: Twist):
-        """Converte o Twist recebido em velocidades de roda.
+        """Guarda as velocidades de roda pedidas pelo Twist; o próximo step() aplica."""
+        v = msg.linear.x    # m/s, positivo = para a frente
+        w = msg.angular.z   # rad/s, positivo = virar à esquerda
 
-        Não fala com o simulador: só guarda o comando, que o próximo step() aplica.
-        """
-        # No Twist, linear.x é a velocidade para frente (m/s) e angular.z é a
-        # velocidade de giro em torno do eixo vertical (rad/s; positivo = virar
-        # à esquerda). As escalas adaptam os valores fixos do teleop a este robô.
-        v = msg.linear.x * self.linear_scale
-        w = msg.angular.z * self.angular_scale
-
-        # Cinemática inversa do robô diferencial: m/s e rad/s -> rad/s de cada roda.
-        # Cada roda está a L/2 do centro, então sua velocidade linear é v ∓ w·L/2.
-        # Dividir pelo raio converte velocidade linear da roda em angular.
-        # Com w > 0 a roda direita gira mais rápido e o robô vira à esquerda.
+        # Cinemática inversa do robô diferencial: cada roda está a L/2 do centro.
         half_track = self.wheel_separation / 2.0
         left = (v - w * half_track) / self.wheel_radius
         right = (v + w * half_track) / self.wheel_radius
 
-        # Se alguma roda passar do limite, divide as duas pelo mesmo fator.
-        # Isso mantém a proporção entre elas, ou seja, a mesma curva, só mais lenta.
-        limit = self.max_wheel_speed
-        excess = max(abs(left), abs(right)) / limit
+        # Satura mantendo a proporção entre as rodas (mesma curva, mais lenta).
+        excess = max(abs(left), abs(right)) / self.max_wheel_speed
         if excess > 1.0:
             left, right = left / excess, right / excess
 
         self.velocity = (left, right)
-        # O comando vale por cmd_timeout segundos a partir de agora.
         self.deadline = time.monotonic() + self.cmd_timeout
+
+    def docking_callback(self, msg: Bool):
+        """Liga (1) ou desliga (0) o modo de docking na cena."""
+        mode = 1 if msg.data else 0
+        self.sim.setInt32Signal(self.prefix + 'Docking', mode)
+        self.get_logger().info(f'modo de docking: {mode}')
+
+    # =========================================================================
+    #  CoppeliaSim -> ROS
+    # =========================================================================
+
+    def read_battery(self):
+        """Nível da bateria em %, ou None antes do primeiro valor da cena."""
+        return self.sim.getFloatSignal(self.prefix + 'Battery')
+
+    def read_charging(self, battery):
+        """Estado de carga, robusto ao sinal que a própria cena apaga.
+
+        O script /chargingBase/beacon escreve Charging = 1 a cada segundo com o
+        robô na base e Charging = 0 uma única vez quando ele sai. O script
+        /myRobot/battery lê e apaga o sinal a cada segundo. Por isso a ponte
+        guarda o último valor visto e, se ele for perdido, confere com a
+        bateria, que sobe carregando e desce descarregando.
+        """
+        value = self.sim.getInt32Signal(self.prefix + 'Charging')
+        if value is not None:
+            self.charging = value == 1
+
+        if battery is not None and self.last_battery is not None:
+            if battery > self.last_battery:
+                self.charging = True
+            elif battery < self.last_battery:
+                self.charging = False
+        if battery is not None:
+            self.last_battery = battery
+        return self.charging
+
+    def read_beacon(self):
+        """(força, ângulo) do beacon; (0, nan) quando o robô não o detecta.
+
+        O beacon da cena só calcula a leitura para o robô cujo handle está no
+        sinal global "Beacon", e só escreve quando o robô está dentro do feixe.
+        Como ele nunca apaga os sinais, a ponte os apaga depois de ler: se não
+        chegar leitura nova em beacon_timeout segundos, o robô saiu do feixe.
+        """
+        self.sim.setInt32Signal('Beacon', self.robotHandle)
+
+        now = time.monotonic()
+        for strength_name, angle_name in BEACON_SIGNALS:
+            strength = self.sim.getFloatSignal(self.prefix + strength_name)
+            angle = self.sim.getFloatSignal(self.prefix + angle_name)
+            if strength is not None and angle is not None:
+                self.sim.clearFloatSignal(self.prefix + strength_name)
+                self.sim.clearFloatSignal(self.prefix + angle_name)
+                self.beacon = (strength, angle)
+                self.beacon_time = now
+                break
+
+        if now - self.beacon_time > self.beacon_timeout:
+            return 0.0, math.nan
+        return self.beacon
 
     def step(self):
         """Executado pelo timer: aplica o comando atual e publica as leituras."""
-        # Sem comando recente o robô para sozinho, mesmo que o teleop caia.
-        # Um teleop de teclado só publica quando uma tecla chega, então soltar
-        # a tecla faz o comando expirar e o robô parar.
+        battery = self.read_battery()
+
+        # --- Motores ---------------------------------------------------------
         if time.monotonic() >= self.deadline:
             self.velocity = (0.0, 0.0)
+        left, right = self.velocity
+        if self.stop_when_battery_empty and battery is not None and battery <= 0.0:
+            left = right = 0.0
+            if not self.battery_empty_warned:
+                self.get_logger().warn('bateria em 0 %: motores parados.')
+                self.battery_empty_warned = True
+        elif battery is not None and battery > 0.0:
+            self.battery_empty_warned = False
+        self.sim.setJointTargetVelocity(self.leftMotorHandle, self.motor_sign * left)
+        self.sim.setJointTargetVelocity(self.rightMotorHandle, self.motor_sign * right)
 
-        # Define a velocidade alvo (rad/s) de cada motor; o motor da simulação
-        # aplica torque para alcançá-la.
-        self.sim.setJointTargetVelocity(self.leftMotorHandle, self.velocity[0])
-        self.sim.setJointTargetVelocity(self.rightMotorHandle, self.velocity[1])
+        # --- Carga e bateria -------------------------------------------------
+        charging = self.read_charging(battery)
+        self.charging_pub.publish(Bool(data=charging))
 
-        # O mesmo carimbo de tempo vale para as duas mensagens deste ciclo.
-        now = self.get_clock().now().to_msg()
+        if battery is not None:
+            state = BatteryState()
+            state.header.stamp = self.get_clock().now().to_msg()
+            state.header.frame_id = 'myRobot'
+            # Grandezas que a cena não simula ficam NaN, como pede a mensagem.
+            state.voltage = math.nan
+            state.current = math.nan
+            state.charge = math.nan
+            state.capacity = math.nan
+            state.design_capacity = math.nan
+            state.temperature = math.nan
+            state.percentage = battery / 100.0   # a mensagem usa 0 a 1
+            if charging and battery >= 100.0:
+                state.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_FULL
+            elif charging:
+                state.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_CHARGING
+            else:
+                state.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+            state.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
+            state.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_UNKNOWN
+            state.present = True
+            self.battery_pub.publish(state)
 
-        # JointState: posição (rad, acumulada) e velocidade (rad/s) medidas nos
-        # motores. As listas seguem a ordem de joints.name.
-        joints = JointState()
-        joints.header.stamp = now
-        joints.name = ['leftMotor', 'rightMotor']
-        joints.position = [
-            self.sim.getJointPosition(self.leftMotorHandle),
-            self.sim.getJointPosition(self.rightMotorHandle),
-        ]
-        joints.velocity = [
-            self.sim.getJointVelocity(self.leftMotorHandle),
-            self.sim.getJointVelocity(self.rightMotorHandle),
-        ]
-        self.joint_pub.publish(joints)
-
-        # readProximitySensor devolve (detectou, distância, ponto detectado,
-        # handle do objeto, normal da superfície); só os dois primeiros importam.
-        detected, distance = self.sim.readProximitySensor(self.sensorNariz)[:2]
-        # Range é a mensagem padrão do ROS para sensores de distância de um feixe.
-        scan = Range()
-        scan.header.stamp = now
-        scan.header.frame_id = 'proximity_sensor'  # referencial em que a medida vale
-        scan.radiation_type = Range.INFRARED
-        scan.field_of_view = 0.1                   # abertura do feixe, em rad
-        scan.min_range = 0.0
-        scan.max_range = self.range_max
-        # Convenção do ROS: fora de alcance é publicado como +infinito.
-        scan.range = float(distance) if detected else float('inf')
-        self.range_pub.publish(scan)
+        # --- Beacon ----------------------------------------------------------
+        strength, angle = self.read_beacon()
+        self.strength_pub.publish(Float32(data=float(strength)))
+        self.angle_pub.publish(Float32(data=float(angle)))
 
     def stop(self):
         """Para os motores e, se foi a ponte que deu o play, para a simulação."""
@@ -265,28 +334,23 @@ class CoppeliaBridge(Node):
 
 def main(args=None):
     # O Ctrl+C só levanta uma flag. Deixar o rclpy ou o KeyboardInterrupt cortarem
-    # o laço no meio de uma chamada ZeroMQ invalida o socket e o contexto, e aí o
-    # comando de parada dos motores nunca chega ao simulador.
+    # o laço no meio de uma chamada ZeroMQ invalida o socket, e aí o comando de
+    # parada dos motores nunca chega ao simulador.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     stop_requested = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop_requested.set())
     signal.signal(signal.SIGTERM, lambda *_: stop_requested.set())
 
-    # Cria o nó. Falhas de conexão ou objeto inexistente chegam aqui como
-    # SystemExit com uma mensagem explicativa (ver connect e find).
     try:
-        node = CoppeliaBridge()
+        node = DockingBridge()
     except SystemExit as erro:
         print(erro)
         rclpy.shutdown()
         return 1
     try:
-        # Equivale a rclpy.spin(node), mas confere a flag a cada 0,1 s.
-        # Cada spin_once executa no máximo um callback pronto (mensagem ou timer).
         while not stop_requested.is_set():
             rclpy.spin_once(node, timeout_sec=0.1)
     finally:
-        # Roda sempre, inclusive depois do Ctrl+C: para o robô e libera o ROS.
         node.stop()
         node.destroy_node()
         rclpy.shutdown()
@@ -294,5 +358,4 @@ def main(args=None):
 
 
 if __name__ == '__main__':
-    # O valor devolvido por main() vira o código de saída do processo.
     raise SystemExit(main())

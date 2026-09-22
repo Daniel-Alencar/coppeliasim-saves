@@ -1,29 +1,45 @@
+"""Sobe a ponte de docking com o CoppeliaSim.
+
+Uso:
+ros2 launch robot_docking robot_docking.launch.py
+ros2 launch robot_docking robot_docking.launch.py robot:=/meuRobo port:=23000
+"""
+
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-    # O ros2 launch procura esta função pelo nome e usa o que ela devolve.
+    robot_arg = DeclareLaunchArgument(
+        'robot',
+        default_value='/myRobot',
+        description='Caminho do robô na cena do CoppeliaSim'
+    )
+    port_arg = DeclareLaunchArgument(
+        'port',
+        default_value='23000',
+        description='Porta da ZeroMQ Remote API do CoppeliaSim'
+    )
 
-    # --- Referenciar os valores ------------------------------------------
-    # LaunchConfiguration NÃO é o valor: é uma promessa de valor, resolvida só
-    # quando o launch roda. Por isso não dá para escrever `if dummy == '1'`
-    # aqui — neste ponto `dummy` é um objeto de substituição, não uma string.
-    robot = LaunchConfiguration('robot')
-
-    # --- Descrever o que subir -------------------------------------------
     return LaunchDescription([
-        # A ponte, que sempre sobe.
+        robot_arg,
+        port_arg,
         Node(
-            package='diff_robot',
-            namespace='diff_robot',
+            package='robot_docking',
+            # O namespace faz os tópicos relativos da ponte virarem
+            # /myRobot/cmd_vel, /myRobot/charging_base/strengthSignal etc.
+            namespace='myRobot',
             executable='coppelia_bridge',
-            name='coppelia_bridge',
+            name='remoteAPI_ROS2_bridge',
             output='screen',
-            # `parameters` é o caminho de entrada para DENTRO do nó: este dict
-            # chega ao processo e é lido por get_parameter('robot') em
-            # coppelia_bridge.py
-            parameters=[{'robot': robot}]
-        )
+            parameters=[{
+                'robot': LaunchConfiguration('robot'),
+                # Argumentos de launch são texto; ParameterValue converte a
+                # porta para inteiro antes de chegar ao nó.
+                'port': ParameterValue(LaunchConfiguration('port'), value_type=int),
+            }]
+        ),
     ])

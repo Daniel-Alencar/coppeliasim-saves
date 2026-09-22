@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = 'robot_docking'
@@ -10,13 +12,14 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='daniel.carvalho',
     maintainer_email='daniel.carvalho@cnpem.br',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Ponte ROS 2 com os sinais de docking do myRobot no CoppeliaSim.',
+    license='MIT',
     extras_require={
         'test': [
             'pytest',
@@ -24,6 +27,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'coppelia_bridge = robot_docking.coppelia_bridge:main',
         ],
     },
 )
