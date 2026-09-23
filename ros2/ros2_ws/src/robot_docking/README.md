@@ -23,7 +23,7 @@ e será usado pelo controlador da próxima atividade.
 
 - ROS 2 Jazzy (`/opt/ros/jazzy`)
 - CoppeliaSim aberto, com a cena de docking
-  (`projects/5 - roomba_docking/Evaluation scene3.2_students.ttt`)
+  (`projects/5 - robot_docking/Evaluation scene3.2_students.ttt`)
 - Cliente Python da Remote API disponível para o `python3` do sistema:
   `pip install --user coppeliasim-zmqremoteapi-client`
 
@@ -59,8 +59,37 @@ encontra um script do robô que faz isso. Os demais scripts (`battery`,
 `odometry`, `dockingSensor`, `encoder`) precisam continuar **habilitados**:
 são eles que produzem os valores publicados.
 
+O `python_controler` oferece uma via de convivência — dois sinais float,
+`<handle>leftVel` e `<handle>rightVel`, que ele lê e aplica no lugar dos
+sliders. O `motor_mode:=signal` usa essa via e mantém o joystick, os rótulos de
+bateria e odometria e o checkbox *docking* funcionando. Só que ele **apaga o
+sinal assim que o lê**, e cada chamada da Remote API custa ~12 ms com a
+simulação rodando, então boa parte dos passos fica sem comando. Medido nesta
+cena, pedindo 0,2 m/s por 4 s no ritmo máximo de escrita:
+
+| `motor_mode` | Distância | Velocidade | Do pedido |
+|---|---|---|---|
+| `joint` (padrão) | 0,689 m | 0,172 m/s | 86 % |
+| `signal` | 0,194 m | 0,047 m/s | 24 % |
+
+Por isso o padrão é `joint`, com o `python_controler` desabilitado.
+
 Como o `python_controler` também parava o robô com a bateria vazia, a ponte
 passou a fazer isso (parâmetro `stop_when_battery_empty`).
+
+### A bateria dura 100 s de simulação
+
+O script `/myRobot/battery` começa em 100 % e gasta **1 % por segundo
+simulado**. Passados ~100 s sem carregar, ela chega a 0 e o robô para — tanto
+pela ponte quanto pelo `python_controler`, que fazem o mesmo corte. Se o robô
+parar de responder ao `cmd_vel` no meio de um teste, confira a bateria antes de
+procurar bug:
+
+```bash
+ros2 topic echo /myRobot/battery --field percentage --once
+```
+
+Parar e dar *play* de novo no CoppeliaSim reinicia a bateria em 100 %.
 
 ---
 
@@ -143,9 +172,11 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard \
 |---|---|---|
 | `robot` | `/myRobot` | Caminho do robô na cena |
 | `port` | `23000` | Porta da ZeroMQ Remote API |
+| `motor_mode` | `joint` | Como o `cmd_vel` chega aos motores |
 
 ```bash
 ros2 launch robot_docking robot_docking.launch.py robot:=/meuRobo port:=23010
+ros2 launch robot_docking robot_docking.launch.py motor_mode:=signal
 ```
 
 ### Sem o launch
@@ -163,12 +194,16 @@ ros2 run robot_docking coppelia_bridge --ros-args -r __ns:=/myRobot
 
 | Tópico | Tipo | Direção | Sinal na cena |
 |---|---|---|---|
-| `/myRobot/cmd_vel` | `geometry_msgs/Twist` | entrada (`linear.x` m/s, `angular.z` rad/s) | — (escreve direto nas juntas) |
+| `/myRobot/cmd_vel` | `geometry_msgs/Twist` | entrada (`linear.x` m/s, `angular.z` rad/s) | juntas, ou `<handle>leftVel`/`<handle>rightVel` (ver `motor_mode`) |
 | `/myRobot/docking` | `std_msgs/Bool` | entrada | `<handle>Docking` (1 ou 0) |
 | `/myRobot/battery` | `sensor_msgs/BatteryState` | saída | `<handle>Battery` |
 | `/myRobot/charging` | `std_msgs/Bool` | saída | `<handle>Charging` |
-| `/myRobot/charging_base/strengthSignal` | `std_msgs/Float32` | saída | `<handle>signalStrength` |
-| `/myRobot/charging_base/relativeAngle` | `std_msgs/Float32` | saída | `<handle>relativeAngle` |
+| `/myRobot/charging_base/strengthSignal` | `std_msgs/Float32` | saída | `<handle>StrengthSignal` |
+| `/myRobot/charging_base/relativeAngle` | `std_msgs/Float32` | saída | `<handle>RelativeAngle` |
+
+> O enunciado chama os sinais do beacon de `signalStrength` e `relativeAngle`,
+> mas o script `/chargingBase/beacon` desta cena escreve `StrengthSignal` e
+> `RelativeAngle`. A ponte procura os dois pares, nessa ordem.
 
 `<handle>` é o handle inteiro do robô na cena, que a ponte descobre sozinha e
 mostra no log de abertura. Na cena de avaliação ele é `84`, então os sinais se
@@ -178,7 +213,7 @@ Conferindo:
 
 ```bash
 ros2 topic list
-ros2 topic hz /myRobot/battery      # deve bater o parâmetro rate (20 Hz)
+ros2 topic hz /myRobot/battery      # deve bater o parâmetro rate (10 Hz)
 ros2 node list                      # /myRobot/remoteAPI_ROS2_bridge
 ```
 
@@ -215,17 +250,24 @@ ros2 node list                      # /myRobot/remoteAPI_ROS2_bridge
 | `robot` | `/myRobot` | Caminho do robô na cena |
 | `wheel_radius` | `0.05` | Raio da roda (m) |
 | `wheel_separation` | `0.0` | Distância entre rodas (m); `0.0` = medir na própria cena |
-| `motor_sign` | `-1.0` | Sinal aplicado às juntas |
+| `motor_sign` | `-1.0` | Sinal aplicado às juntas (só em `motor_mode=joint`) |
+| `motor_mode` | `joint` | `joint` = escreve nas juntas; `signal` = escreve `leftVel`/`rightVel` e convive com o `python_controler` |
 | `max_wheel_speed` | `10.0` | Limite por roda (rad/s); satura mantendo a curva |
 | `cmd_timeout` | `0.5` | Segundos sem `cmd_vel` até parar |
 | `beacon_timeout` | `0.5` | Segundos sem leitura do beacon até publicar "sem sinal" |
 | `stop_when_battery_empty` | `true` | Com a bateria em 0 %, os motores ficam parados |
-| `rate` | `20.0` | Frequência do laço que fala com o simulador (Hz) |
+| `rate` | `10.0` | Frequência de leitura dos sensores (Hz) |
+| `motor_rate` | `20.0` | Frequência de escrita nos motores (Hz) |
 | `autostart` | `true` | Dar *play* se a simulação estiver parada |
 
 O `motor_sign` existe porque, nesta cena, velocidade **negativa** faz o robô
 andar para a frente. É a mesma convenção do `python_controler`, que usa
 `-vel/raio`. Se o robô andar ao contrário, troque para `1.0`.
+
+As duas frequências são baixas de propósito. Com a simulação rodando, cada
+chamada da Remote API só é atendida entre passos e custa ~12 ms (medido nesta
+cena), o que dá um teto de ~80 chamadas por segundo para a ponte inteira.
+Aumentar `rate` ou `motor_rate` não deixa nada mais rápido: só enfileira.
 
 Como o launch só repassa o `robot` e a `port`, ajuste os outros em tempo de
 execução:
@@ -243,7 +285,10 @@ ros2 param list /myRobot/remoteAPI_ROS2_bridge
 |---|---|
 | `Não consegui falar com o CoppeliaSim em localhost:23000` | Abra o simulador. Se já estiver aberto, algum script da cena está travando a thread principal — pare a simulação e desabilite esse script |
 | `Objeto "/myRobot/leftMotor" não existe na cena` | A ponte lista os objetos existentes no terminal; ajuste `robot:=` ou renomeie na cena |
-| `o script X está habilitado e escreve nos motores a cada passo` | Desabilite o `/myRobot/python_controler` na cena |
+| `motor_mode=joint, mas estes scripts da cena escrevem nos motores` | Desabilite o `/myRobot/python_controler` na cena, ou use `motor_mode:=signal` |
+| `motor_mode=signal, mas nenhum script habilitado do robô lê os sinais` | Habilite o `python_controler`, ou volte para `motor_mode:=joint` |
+| O robô anda muito mais devagar que o `linear.x` pedido | `motor_mode=signal` entrega ~25 % da velocidade; use `joint` |
+| O robô parou de responder ao `cmd_vel` do nada | Bateria zerada (100 s de simulação); pare e dê *play* de novo |
 | `a simulação está pausada` | Dê *play* no CoppeliaSim; motores pausados ignoram comandos |
 | O robô anda para trás com `linear.x` positivo | Troque `motor_sign` para `1.0` |
 | `battery` não publica nada | O script da bateria só escreve o primeiro valor depois de 1 s de simulação; confira se ele está habilitado |

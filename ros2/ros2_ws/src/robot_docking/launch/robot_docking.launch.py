@@ -3,6 +3,7 @@
 Uso:
 ros2 launch robot_docking robot_docking.launch.py
 ros2 launch robot_docking robot_docking.launch.py robot:=/meuRobo port:=23000
+ros2 launch robot_docking robot_docking.launch.py motor_mode:=signal
 """
 
 from launch import LaunchDescription
@@ -23,10 +24,20 @@ def generate_launch_description():
         default_value='23000',
         description='Porta da ZeroMQ Remote API do CoppeliaSim'
     )
+    motor_mode_arg = DeclareLaunchArgument(
+        'motor_mode',
+        default_value='joint',
+        description=(
+            'joint: escreve nas juntas (exige desabilitar o python_controler '
+            'da cena). signal: escreve os sinais leftVel/rightVel e convive '
+            'com ele, mas entrega só ~25 % da velocidade pedida'
+        )
+    )
 
     return LaunchDescription([
         robot_arg,
         port_arg,
+        motor_mode_arg,
         Node(
             package='robot_docking',
             # O namespace faz os tópicos relativos da ponte virarem
@@ -40,6 +51,7 @@ def generate_launch_description():
                 # Argumentos de launch são texto; ParameterValue converte a
                 # porta para inteiro antes de chegar ao nó.
                 'port': ParameterValue(LaunchConfiguration('port'), value_type=int),
+                'motor_mode': LaunchConfiguration('motor_mode'),
             }]
         ),
     ])

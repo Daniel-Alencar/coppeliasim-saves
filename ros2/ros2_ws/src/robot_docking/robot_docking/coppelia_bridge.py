@@ -9,12 +9,41 @@ escrevendo os sinais da cena pela ZeroMQ Remote API:
     <handle>signalStrength (float)  --->     charging_base/strengthSignal  std_msgs/Float32
     <handle>relativeAngle  (float)  --->     charging_base/relativeAngle   std_msgs/Float32
     <handle>Docking        (int)    <---     docking                       std_msgs/Bool
-    leftMotor / rightMotor (juntas) <---     cmd_vel                       geometry_msgs/Twist
+    motores                         <---     cmd_vel                       geometry_msgs/Twist
 
 <handle> é o handle inteiro do robô na cena, por exemplo 84Battery.
 
 Os tópicos são relativos: com o namespace myRobot do launch viram
 /myRobot/battery, /myRobot/cmd_vel etc.
+
+Como o cmd_vel chega aos motores (parâmetro motor_mode)
+-------------------------------------------------------
+A cena "Evaluation scene3.2_students.ttt" já traz o script
+/myRobot/python_controler habilitado, e ele chama setJointTargetVelocity nos
+dois motores a CADA passo de simulação. Escrever nas juntas pela Remote API
+disputa com ele a cada passo, e o robô anda aos solavancos. O script prevê essa
+situação e oferece uma via oficial de override, dois sinais float que ele lê e
+apaga a cada passo:
+
+    <handle>leftVel  / <handle>rightVel   (m/s na roda, não rad/s)
+
+Daí os dois modos:
+
+    motor_mode='joint'  (padrão)  chama setJointTargetVelocity direto, que é o
+        que o enunciado pede. EXIGE desabilitar o /myRobot/python_controler na
+        cena, senão ele sobrescreve os comandos.
+
+    motor_mode='signal'           escreve os sinais de override. Convive com o
+        python_controler (joystick, rótulos e checkbox "docking" seguem vivos),
+        mas é MUITO pior: o script apaga o sinal assim que o lê, e cada chamada
+        da Remote API custa ~12 ms com a simulação rodando, então na prática só
+        parte dos passos recebe comando. Medido nesta cena, pedindo 0,2 m/s e
+        escrevendo no ritmo máximo por 4 s:
+
+            motor_mode='joint'   0,689 m  ->  0,172 m/s   (86 % do pedido)
+            motor_mode='signal'  0,194 m  ->  0,047 m/s   (24 % do pedido)
+
+        Use 'signal' só se precisar do joystick da cena junto com o ROS 2.
 
 Esta ponte não implementa o docking autônomo: só a comunicação.
 """
@@ -58,13 +87,21 @@ class DockingBridge(Node):
         # Nesta cena as juntas estão montadas de modo que velocidade negativa
         # faz o robô andar para a frente (o python_controler da cena usa -vel/r).
         self.declare_parameter('motor_sign', -1.0)
+        # 'signal' = sinais <handle>leftVel/<handle>rightVel, convivendo com o
+        # python_controler da cena; 'joint' = setJointTargetVelocity direto.
+        self.declare_parameter('motor_mode', 'joint')
         self.declare_parameter('max_wheel_speed', 10.0)  # limite por roda, em rad/s
         self.declare_parameter('cmd_timeout', 0.5)       # segundos até parar sem comando
         # Segundos sem leitura nova do beacon até considerar que o sinal sumiu.
         self.declare_parameter('beacon_timeout', 0.5)
         # Com a bateria em 0 % o robô não anda, como fazia o python_controler.
         self.declare_parameter('stop_when_battery_empty', True)
-        self.declare_parameter('rate', 20.0)             # frequência do laço step(), em Hz
+        # Com a simulação rodando, cada chamada da Remote API custa ~12 ms
+        # (medido): ela só é atendida entre passos de simulação. Isso dá um teto
+        # de ~80 chamadas por segundo para a ponte inteira, e é o que limita
+        # estas duas frequências — subi-las não acelera nada, só enfileira.
+        self.declare_parameter('rate', 10.0)             # sensores, em Hz (~5 chamadas por ciclo)
+        self.declare_parameter('motor_rate', 20.0)       # motores, em Hz (2 chamadas por ciclo)
         self.declare_parameter('autostart', True)        # dar play se a simulação estiver parada
 
         host = self.get_parameter('host').value
@@ -72,6 +109,11 @@ class DockingBridge(Node):
         robot = self.get_parameter('robot').value
         self.wheel_radius = self.get_parameter('wheel_radius').value
         self.motor_sign = self.get_parameter('motor_sign').value
+        self.motor_mode = self.get_parameter('motor_mode').value
+        if self.motor_mode not in ('signal', 'joint'):
+            raise SystemExit(
+                f'motor_mode inválido: "{self.motor_mode}". Use "signal" ou "joint".'
+            )
         self.max_wheel_speed = self.get_parameter('max_wheel_speed').value
         self.cmd_timeout = self.get_parameter('cmd_timeout').value
         self.beacon_timeout = self.get_parameter('beacon_timeout').value
@@ -85,7 +127,7 @@ class DockingBridge(Node):
         # Os sinais do robô são nomeados com o handle dele na frente, por
         # exemplo "84Battery". str() do handle é exatamente esse prefixo.
         self.prefix = str(self.robotHandle)
-        self.warn_motor_scripts(robot)
+        self.check_motor_scripts(robot)
 
         self.wheel_separation = self.get_parameter('wheel_separation').value
         if self.wheel_separation <= 0.0:
@@ -109,8 +151,12 @@ class DockingBridge(Node):
             )
 
         # --- Estado interno --------------------------------------------------
-        self.velocity = (0.0, 0.0)     # (esquerda, direita) em rad/s, já sem o motor_sign
+        # (esquerda, direita) em m/s NA RODA. Guardar em m/s, e não em rad/s, é o
+        # que permite os dois motor_mode: é a unidade que o python_controler
+        # espera nos sinais, e vira rad/s dividindo pelo raio no modo 'joint'.
+        self.velocity = (0.0, 0.0)
         self.deadline = 0.0            # instante em que o último cmd_vel expira
+        self.battery = None            # último nível lido, para o corte em 0 %
         self.last_battery = None       # nível anterior, para saber se sobe ou desce
         self.charging = False          # último estado de carga conhecido
         self.beacon = (0.0, math.nan)  # (força, ângulo) da última leitura válida
@@ -125,9 +171,14 @@ class DockingBridge(Node):
         self.strength_pub = self.create_publisher(Float32, 'charging_base/strengthSignal', 10)
         self.angle_pub = self.create_publisher(Float32, 'charging_base/relativeAngle', 10)
 
+        # Dois timers: os sensores não precisam da pressa dos motores.
         self.create_timer(1.0 / self.get_parameter('rate').value, self.step)
+        self.create_timer(
+            1.0 / self.get_parameter('motor_rate').value, self.apply_motors
+        )
         self.get_logger().info(
-            f'ponte pronta. comandos em {self.resolve_topic_name("cmd_vel")} e '
+            f'ponte pronta (motor_mode={self.motor_mode}). comandos em '
+            f'{self.resolve_topic_name("cmd_vel")} e '
             f'{self.resolve_topic_name("docking")}'
         )
 
@@ -166,24 +217,37 @@ class DockingBridge(Node):
             '  ros2 launch robot_docking robot_docking.launch.py robot:=/meuRobo'
         )
 
-    def warn_motor_scripts(self, robot):
-        """Avisa sobre scripts do robô que também escrevem nos motores.
+    def check_motor_scripts(self, robot):
+        """Confere se os scripts da cena combinam com o motor_mode escolhido.
 
-        Só esses disputam o controle com a ponte. Os demais (bateria,
-        odometria, encoders, sensor de docking) precisam continuar habilitados.
+        Só os scripts que escrevem nos motores importam aqui. Os demais
+        (bateria, odometria, encoders, sensor de docking) precisam continuar
+        habilitados nos dois modos.
         """
-        scripts = self.sim.getObjectsInTree(
+        rivals = []
+        for h in self.sim.getObjectsInTree(
             self.sim.getObject(robot), self.sim.sceneobject_script
-        )
-        for h in scripts:
+        ):
             if self.sim.getBoolProperty(h, 'scriptDisabled'):
                 continue
             if 'setJointTargetVelocity' in self.sim.getStringProperty(h, 'code'):
-                self.get_logger().warn(
-                    f'o script {self.sim.getObjectAlias(h, 2)} está habilitado e '
-                    'escreve nos motores a cada passo, sobrescrevendo o cmd_vel. '
-                    'Desabilite-o na cena.'
-                )
+                rivals.append(self.sim.getObjectAlias(h, 2))
+
+        if self.motor_mode == 'joint' and rivals:
+            # Os dois escrevem nas mesmas juntas: quem escrever por último vence,
+            # e o script da cena escreve a cada passo de simulação.
+            self.get_logger().warn(
+                'motor_mode=joint, mas estes scripts da cena escrevem nos motores '
+                f'a cada passo e vão sobrescrever o cmd_vel: {", ".join(rivals)}. '
+                'Desabilite-os na cena, ou use motor_mode:=signal.'
+            )
+        elif self.motor_mode == 'signal' and not rivals:
+            # Ninguém lê os sinais leftVel/rightVel: o robô não vai sair do lugar.
+            self.get_logger().warn(
+                'motor_mode=signal, mas nenhum script habilitado do robô lê os '
+                f'sinais {self.prefix}leftVel/{self.prefix}rightVel. Habilite o '
+                'python_controler na cena, ou use motor_mode:=joint.'
+            )
 
     def measure_wheel_separation(self):
         """Distância entre os dois motores, lida direto da cena."""
@@ -196,17 +260,21 @@ class DockingBridge(Node):
     # =========================================================================
 
     def cmd_vel_callback(self, msg: Twist):
-        """Guarda as velocidades de roda pedidas pelo Twist; o próximo step() aplica."""
+        """Guarda as velocidades de roda pedidas pelo Twist; apply_motors aplica."""
         v = msg.linear.x    # m/s, positivo = para a frente
         w = msg.angular.z   # rad/s, positivo = virar à esquerda
 
-        # Cinemática inversa do robô diferencial: cada roda está a L/2 do centro.
+        # Cinemática inversa do robô diferencial: cada roda está a L/2 do centro,
+        # então sua velocidade linear é v ∓ w·L/2. É a mesma conta que o
+        # python_controler faz com os sliders do joystick.
         half_track = self.wheel_separation / 2.0
-        left = (v - w * half_track) / self.wheel_radius
-        right = (v + w * half_track) / self.wheel_radius
+        left = v - w * half_track     # m/s
+        right = v + w * half_track    # m/s
 
         # Satura mantendo a proporção entre as rodas (mesma curva, mais lenta).
-        excess = max(abs(left), abs(right)) / self.max_wheel_speed
+        # max_wheel_speed está em rad/s; vezes o raio dá o limite em m/s.
+        limit = self.max_wheel_speed * self.wheel_radius
+        excess = max(abs(left), abs(right)) / limit
         if excess > 1.0:
             left, right = left / excess, right / excess
 
@@ -214,7 +282,14 @@ class DockingBridge(Node):
         self.deadline = time.monotonic() + self.cmd_timeout
 
     def docking_callback(self, msg: Bool):
-        """Liga (1) ou desliga (0) o modo de docking na cena."""
+        """Liga (1) ou desliga (0) o modo de docking na cena.
+
+        Quem consome esse sinal é o python_controler: ele reage a 1, apaga o
+        sinal e marca o checkbox "docking" do joystick, que é a confirmação
+        visível de que o comando chegou. Ele ignora o 0 e não existe, nesta
+        cena, quem desmarque o checkbox ou desligue o modo — o comportamento
+        de docking em si é o que será implementado na próxima atividade.
+        """
         mode = 1 if msg.data else 0
         self.sim.setInt32Signal(self.prefix + 'Docking', mode)
         self.get_logger().info(f'modo de docking: {mode}')
@@ -274,23 +349,48 @@ class DockingBridge(Node):
             return 0.0, math.nan
         return self.beacon
 
-    def step(self):
-        """Executado pelo timer: aplica o comando atual e publica as leituras."""
-        battery = self.read_battery()
+    def write_motors(self, left, right):
+        """Entrega (esquerda, direita), em m/s na roda, conforme o motor_mode."""
+        if self.motor_mode == 'signal':
+            # O python_controler lê estes dois sinais, divide pelo raio da roda e
+            # aplica o sinal negativo. Por isso aqui vai m/s, cru.
+            self.sim.setFloatSignal(self.prefix + 'leftVel', float(left))
+            self.sim.setFloatSignal(self.prefix + 'rightVel', float(right))
+        else:
+            # Sem o script no meio, as duas conversões são nossas.
+            self.sim.setJointTargetVelocity(
+                self.leftMotorHandle, self.motor_sign * left / self.wheel_radius
+            )
+            self.sim.setJointTargetVelocity(
+                self.rightMotorHandle, self.motor_sign * right / self.wheel_radius
+            )
 
-        # --- Motores ---------------------------------------------------------
+    def apply_motors(self):
+        """Executado pelo timer dos motores: repõe o último comando na cena.
+
+        Precisa repor a cada ciclo porque o python_controler apaga os sinais
+        assim que os lê: um ciclo sem escrita e ele volta a obedecer o joystick.
+        """
+        # Sem comando recente o robô para sozinho, mesmo que o controlador caia.
         if time.monotonic() >= self.deadline:
             self.velocity = (0.0, 0.0)
         left, right = self.velocity
-        if self.stop_when_battery_empty and battery is not None and battery <= 0.0:
+
+        # Mesmo corte que o python_controler faz: bateria zerada, robô parado.
+        if self.stop_when_battery_empty and self.battery is not None and self.battery <= 0.0:
             left = right = 0.0
             if not self.battery_empty_warned:
                 self.get_logger().warn('bateria em 0 %: motores parados.')
                 self.battery_empty_warned = True
-        elif battery is not None and battery > 0.0:
+        elif self.battery is not None and self.battery > 0.0:
             self.battery_empty_warned = False
-        self.sim.setJointTargetVelocity(self.leftMotorHandle, self.motor_sign * left)
-        self.sim.setJointTargetVelocity(self.rightMotorHandle, self.motor_sign * right)
+
+        self.write_motors(left, right)
+
+    def step(self):
+        """Executado pelo timer dos sensores: lê a cena e publica no ROS."""
+        battery = self.read_battery()
+        self.battery = battery
 
         # --- Carga e bateria -------------------------------------------------
         charging = self.read_charging(battery)
@@ -326,6 +426,9 @@ class DockingBridge(Node):
 
     def stop(self):
         """Para os motores e, se foi a ponte que deu o play, para a simulação."""
+        self.write_motors(0.0, 0.0)
+        # No modo signal as juntas ficariam com o último alvo caso o script não
+        # chegue a ler o sinal zero; zerá-las também é barato e garante a parada.
         self.sim.setJointTargetVelocity(self.leftMotorHandle, 0.0)
         self.sim.setJointTargetVelocity(self.rightMotorHandle, 0.0)
         if self.started_here:
