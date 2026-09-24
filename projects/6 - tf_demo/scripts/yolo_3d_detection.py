@@ -19,7 +19,7 @@ class Yolo3DPublisher(Node):
         self.model = YOLO("yolov8n.pt")
 
         # Camera intrinsics
-        self.fx = 517.306408                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+        self.fx = 517.306408                                       
         self.fy = 516.469215
         self.cx = 318.643040
         self.cy = 235.313989
