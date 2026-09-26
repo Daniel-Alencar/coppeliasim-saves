@@ -104,7 +104,7 @@ terminais:
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /opt/ros/jazzy/setup.zsh
-cd "projects/6 - tf_demo/scripts"
+cd "projects/5 - tf_demo/scripts"
 ```
 
 **Terminal 1 — a câmera:**

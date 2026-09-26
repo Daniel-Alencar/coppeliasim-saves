@@ -35,7 +35,7 @@ ros2_ws/
 ```
 
 Apenas `src/` entra no Git. As outras três são geradas por `colcon build` e por
-isso estão no [.gitignore](.gitignore) do repositório:
+isso estão no [.gitignore](../.gitignore) do repositório:
 
 ```
 build/

@@ -23,7 +23,7 @@ e será usado pelo controlador da próxima atividade.
 
 - ROS 2 Jazzy (`/opt/ros/jazzy`)
 - CoppeliaSim aberto, com a cena de docking
-  (`projects/5 - robot_docking/Evaluation scene3.2_students.ttt`)
+  (`coppeliasim/robot/Evaluation scene3.2_students.ttt`, nesta mesma pasta)
 - Cliente Python da Remote API disponível para o `python3` do sistema:
   `pip install --user coppeliasim-zmqremoteapi-client`
 
