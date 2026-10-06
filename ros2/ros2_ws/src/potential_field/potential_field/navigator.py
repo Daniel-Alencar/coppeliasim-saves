@@ -61,6 +61,26 @@ class PotentialFieldNavigator(Node):
         # Com erro de rumo maior que isto o robô gira parado, em vez de andar torto.
         self.declare_parameter('turn_in_place', math.radians(75.0))
         self.declare_parameter('collect_radius', 0.10)   # conta como alcançada [m]
+        # O ciclo de controle é disparado pela pose. Se ela parar de chegar (a
+        # ponte caiu, a simulação parou), o último cmd_vel continuaria valendo
+        # e o robô seguiria às cegas. Passado este tempo, manda parar.
+        self.declare_parameter('pose_timeout', 1.0)      # [s]
+
+        # --- Busca -----------------------------------------------------------
+        # Com o mapa vindo da câmera, "nenhuma banana conhecida" não quer dizer
+        # que acabou: quer dizer que ainda não vimos nenhuma. Então o robô gira
+        # para varrer o ambiente e, se não achar nada, anda um pouco e gira de
+        # novo. Só desiste depois de search_timeout sem encontrar banana.
+        self.declare_parameter('search', True)
+        # Varredura devagar: girando rápido, a posição estimada pela câmera
+        # fica ruim e o mapa enche de cópias do mesmo objeto.
+        self.declare_parameter('search_w', 0.4)          # giro da varredura [rad/s]
+        self.declare_parameter('search_v', 0.18)         # avanço da varredura [m/s]
+        self.declare_parameter('search_spin_time', 8.0)  # tempo girando [s]
+        self.declare_parameter('search_move_time', 3.0)  # tempo andando [s]
+        self.declare_parameter('search_timeout', 120.0)  # desiste depois disso [s]
+        # Distância para considerar que duas bananas do mapa são a mesma.
+        self.declare_parameter('map_tolerance', 0.20)    # [m]
 
         # --- Mínimos locais --------------------------------------------------
         # O campo pode empatar: a repulsão dos poops cancela a atração e o robô
@@ -81,6 +101,9 @@ class PotentialFieldNavigator(Node):
         self.finished = False
         self.reset_progress()
         self.swirl_sign = 1.0   # para que lado a tangencial desvia
+        self.gone = []          # bananas que este nó já deu por coletadas
+        self.search_since = None   # quando a busca começou
+        self.search_phase = None   # ('spin' | 'move', instante em que começou)
 
         # --- Comunicação ROS -------------------------------------------------
         # O mapa é publicado com transient local: mesmo subindo depois da ponte,
@@ -95,6 +118,12 @@ class PotentialFieldNavigator(Node):
         self.force_pub = self.create_publisher(Vector3Stamped, 'force', 10)
         self.collected_pub = self.create_publisher(Int32, 'collected', 10)
 
+        # Vigia da pose: roda em paralelo ao ciclo de controle, que só acontece
+        # quando chega pose. Sem esse timer, nada notaria a ausência dela.
+        self.last_pose_time = None
+        self.pose_lost = False
+        self.create_timer(0.2, self.check_pose_timeout)
+
         self.get_logger().info('navegador pronto, esperando o mapa e a pose')
 
     # =========================================================================
@@ -102,17 +131,42 @@ class PotentialFieldNavigator(Node):
     # =========================================================================
 
     def bananas_callback(self, msg: PoseArray):
-        """Guarda as bananas; recomeça se a cena mudou (novo play)."""
+        """Atualiza o mapa de bananas sem perder o que já foi feito.
+
+        O mapa pode chegar pronto (ponte lendo os sinais da cena) ou ir
+        crescendo quando a câmera descobre bananas novas. Nos dois casos, as
+        que aparecem são somadas às pendentes, e as que somem do mapa saem das
+        pendentes: no caminho da percepção, sumir quer dizer que foi recolhida.
+        """
         bananas = [(p.position.x, p.position.y) for p in msg.poses]
         if bananas == self.bananas:
             return
+        tol = self.get_parameter('map_tolerance').value
+
+        novas = [b for b in bananas
+                 if not self.near_any(b, self.pending, tol)
+                 and not self.near_any(b, self.gone, tol)]
+        sumiram = [b for b in self.pending if not self.near_any(b, bananas, tol)]
+
         self.bananas = bananas
-        self.pending = list(bananas)
-        self.target = None
-        self.collected = 0
-        self.finished = False
-        self.reset_progress()
-        self.get_logger().info(f'{len(bananas)} bananas no mapa')
+        self.pending = [b for b in self.pending if b not in sumiram] + novas
+        if self.target is not None and self.target in sumiram:
+            self.target = None
+            self.reset_progress()
+        if novas:
+            self.finished = False
+            self.search_phase = None
+            self.search_since = None
+        if novas or sumiram:
+            self.get_logger().info(
+                f'mapa: {len(bananas)} bananas conhecidas, {len(self.pending)} '
+                f'pendentes (+{len(novas)} novas, -{len(sumiram)} que sumiram)'
+            )
+
+    @staticmethod
+    def near_any(point, pontos, tol):
+        """Diz se há algum ponto da lista a menos de tol do ponto dado."""
+        return any(math.hypot(point[0] - p[0], point[1] - p[1]) <= tol for p in pontos)
 
     def poops_callback(self, msg: PoseArray):
         poops = [(p.position.x, p.position.y) for p in msg.poses]
@@ -236,8 +290,11 @@ class PotentialFieldNavigator(Node):
 
     def pose_callback(self, msg: PoseStamped):
         """Um ciclo de controle, disparado por cada pose que chega da ponte."""
-        if self.finished or not self.bananas:
+        self.last_pose_time = self.get_clock().now().nanoseconds / 1e9
+        if self.finished:
             return
+        # Sem mapa ainda não é o fim: com a câmera montando o mapa, é hora de
+        # procurar. O choose_target devolve None e a busca assume lá embaixo.
 
         x = msg.pose.position.x
         y = msg.pose.position.y
@@ -251,6 +308,7 @@ class PotentialFieldNavigator(Node):
         if self.target is not None:
             if math.hypot(self.target[0] - x, self.target[1] - y) <= collect_radius:
                 self.pending.remove(self.target)
+                self.gone.append(self.target)
                 self.collected += 1
                 self.collected_pub.publish(Int32(data=self.collected))
                 self.get_logger().info(
@@ -263,12 +321,19 @@ class PotentialFieldNavigator(Node):
             self.target = self.choose_target(x, y)
             self.reset_progress()
             if self.target is None:
+                # Nenhuma banana conhecida. Com o mapa vindo dos sinais isso é
+                # o fim; com o mapa vindo da câmera, é hora de procurar.
+                if self.get_parameter('search').value:
+                    self.do_search(x, y, theta, now)
+                    return
                 self.publish_cmd(0.0, 0.0)
                 self.finished = True
                 self.get_logger().info(
                     f'todas as {self.collected} bananas coletadas, parando'
                 )
                 return
+        self.search_phase = None
+        self.search_since = None
 
         self.publish_target(msg.header.frame_id)
 
@@ -307,6 +372,52 @@ class PotentialFieldNavigator(Node):
         self.publish_cmd(v, w)
 
     # =========================================================================
+    #  Busca
+    # =========================================================================
+
+    def do_search(self, x, y, theta, now):
+        """Varre o ambiente até a câmera achar uma banana.
+
+        Alterna girar no lugar, que mostra todo o entorno à câmera, e andar,
+        que leva a câmera para outro pedaço da sala. Enquanto anda, a repulsão
+        dos poops continua valendo, então a busca também os evita.
+        """
+        if self.search_since is None:
+            self.search_since = now
+            self.get_logger().info('nenhuma banana conhecida: procurando')
+        if now - self.search_since > self.get_parameter('search_timeout').value:
+            self.publish_cmd(0.0, 0.0)
+            self.finished = True
+            self.get_logger().info(
+                f'{self.get_parameter("search_timeout").value:.0f} s sem achar banana; '
+                f'parando com {self.collected} coletadas'
+            )
+            return
+
+        spin_time = self.get_parameter('search_spin_time').value
+        move_time = self.get_parameter('search_move_time').value
+        if self.search_phase is None:
+            self.search_phase = ('spin', now)
+        fase, desde = self.search_phase
+        if fase == 'spin' and now - desde >= spin_time:
+            self.search_phase = fase, desde = ('move', now)
+        elif fase == 'move' and now - desde >= move_time:
+            self.search_phase = fase, desde = ('spin', now)
+
+        if fase == 'spin':
+            self.publish_cmd(0.0, self.get_parameter('search_w').value)
+            return
+
+        # Andando: segue o rumo atual, desviado pela repulsão dos poops.
+        rx, ry = self.repulsive(x, y)
+        fx, fy = math.cos(theta) + rx, math.sin(theta) + ry
+        erro = wrap(math.atan2(fy, fx) - theta)
+        w_max = self.get_parameter('w_max').value
+        w = max(-w_max, min(w_max, self.get_parameter('k_heading').value * erro))
+        v = self.get_parameter('search_v').value * math.cos(erro)
+        self.publish_cmd(max(0.0, v), w)
+
+    # =========================================================================
     #  Publicações
     # =========================================================================
 
@@ -333,6 +444,24 @@ class PotentialFieldNavigator(Node):
         msg.vector.x = float(fx)
         msg.vector.y = float(fy)
         self.force_pub.publish(msg)
+
+    def check_pose_timeout(self):
+        """Para o robô quando a pose para de chegar."""
+        if self.last_pose_time is None or self.finished:
+            return
+        agora = self.get_clock().now().nanoseconds / 1e9
+        atraso = agora - self.last_pose_time
+        if atraso > self.get_parameter('pose_timeout').value:
+            if not self.pose_lost:
+                self.pose_lost = True
+                self.get_logger().warn(
+                    f'sem pose há {atraso:.1f} s: parando o robô. '
+                    'A ponte está rodando e a simulação em play?'
+                )
+            self.stop()
+        elif self.pose_lost:
+            self.pose_lost = False
+            self.get_logger().info('pose voltou, retomando')
 
     def stop(self):
         self.publish_cmd(0.0, 0.0)

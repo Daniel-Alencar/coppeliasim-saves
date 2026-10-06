@@ -35,6 +35,7 @@ parâmetro motor_sign (-1.0) resolve. Esse script precisa estar DESABILITADO:
 ele escreve nos motores a cada passo de simulação e anula o cmd_vel.
 """
 
+import array       # buffer de profundidade, float por pixel
 import math        # math.dist, math.hypot, math.sin/cos
 import signal      # tratamento manual do Ctrl+C (SIGINT) e do SIGTERM
 import threading   # threading.Event: flag de parada segura entre sinal e laço
@@ -42,11 +43,29 @@ import time        # time.monotonic: relógio que nunca volta, ideal para prazos
 
 # Coppelia ZeroMQ Remote API: chama as funções sim.* a partir de outro processo.
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Twist
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, TransformStamped, Twist
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
+from sensor_msgs.msg import CameraInfo, Image
+import tf2_ros
+
+
+def matrix_to_quaternion(m):
+    """Quaternion (x, y, z, w) da matriz 3x4 do CoppeliaSim, em ordem de linhas."""
+    traco = m[0] + m[5] + m[10]
+    if traco > 0.0:
+        s = math.sqrt(traco + 1.0) * 2.0
+        return ((m[9] - m[6]) / s, (m[2] - m[8]) / s, (m[4] - m[1]) / s, 0.25 * s)
+    if m[0] > m[5] and m[0] > m[10]:
+        s = math.sqrt(1.0 + m[0] - m[5] - m[10]) * 2.0
+        return (0.25 * s, (m[1] + m[4]) / s, (m[2] + m[8]) / s, (m[9] - m[6]) / s)
+    if m[5] > m[10]:
+        s = math.sqrt(1.0 + m[5] - m[0] - m[10]) * 2.0
+        return ((m[1] + m[4]) / s, 0.25 * s, (m[6] + m[9]) / s, (m[2] - m[8]) / s)
+    s = math.sqrt(1.0 + m[10] - m[0] - m[5]) * 2.0
+    return ((m[2] + m[8]) / s, (m[6] + m[9]) / s, 0.25 * s, (m[4] - m[1]) / s)
 
 
 def unpack_pairs(flat):
@@ -88,6 +107,24 @@ class CoppeliaBridge(Node):
         self.declare_parameter('frame_id', 'world')      # referencial das mensagens
         self.declare_parameter('autostart', True)        # dar play se estiver parada
 
+        # --- De onde vem o mapa ----------------------------------------------
+        # 'signals': lê as posições prontas dos sinais da cena (gabarito).
+        # 'perception': não publica mapa nenhum; quem monta é o perception_map,
+        #   a partir do que a câmera vê. É o modo do exercício com YOLO.
+        self.declare_parameter('map_source', 'signals')
+
+        # --- Câmera e TF ------------------------------------------------------
+        # Com 'perception' a ponte também publica as imagens da Kinect da cena e
+        # a TF mundo -> robô -> câmera, que o perception_map usa para levar as
+        # detecções da câmera para o mundo.
+        self.declare_parameter('publish_images', False)
+        self.declare_parameter('publish_tf', True)
+        self.declare_parameter('rgb_sensor', 'kinect/rgb')     # relativo ao robô
+        self.declare_parameter('depth_sensor', 'kinect/depth')
+        self.declare_parameter('image_rate', 5.0)              # [Hz]
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('camera_frame', 'camera_color_optical_frame')
+
         host = self.get_parameter('host').value
         port = self.get_parameter('port').value
         robot = self.get_parameter('robot').value
@@ -98,6 +135,13 @@ class CoppeliaBridge(Node):
         self.max_wheel_speed = self.get_parameter('max_wheel_speed').value
         self.cmd_timeout = self.get_parameter('cmd_timeout').value
         self.frame_id = self.get_parameter('frame_id').value
+        self.map_source = self.get_parameter('map_source').value
+        self.base_frame = self.get_parameter('base_frame').value
+        self.camera_frame = self.get_parameter('camera_frame').value
+        # No modo percepção as imagens são obrigatórias: sem elas não há detecção.
+        self.publish_images = (
+            self.get_parameter('publish_images').value or self.map_source == 'perception'
+        )
 
         # --- Conexão com o CoppeliaSim ---------------------------------------
         self.sim = self.connect(host, port)
@@ -143,15 +187,37 @@ class CoppeliaBridge(Node):
         self.pose_pub = self.create_publisher(PoseStamped, 'pose', 10)
         self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
 
+        # Câmera e TF, usados pelo caminho da percepção.
+        self.rgb_pub = self.create_publisher(Image, 'rgb/image', 1)
+        self.depth_pub = self.create_publisher(Image, 'depth/image', 1)
+        self.info_pub = self.create_publisher(CameraInfo, 'rgb/camera_info', 1)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.rgbHandle = -1
+        self.depthHandle = -1
+        self.camera_info = None
+        self.camera_pose = None
+        if self.publish_images:
+            self.setup_camera(robot)
+
         # Três timers: pose, motores e releitura do mapa têm ritmos diferentes.
         self.create_timer(1.0 / self.get_parameter('rate').value, self.step)
         self.create_timer(
             1.0 / self.get_parameter('motor_rate').value, self.apply_motors
         )
-        self.create_timer(
-            1.0 / self.get_parameter('map_rate').value, self.publish_map
-        )
-        self.publish_map()
+        if self.map_source == 'signals':
+            self.create_timer(
+                1.0 / self.get_parameter('map_rate').value, self.publish_map
+            )
+            self.publish_map()
+        else:
+            self.get_logger().info(
+                'map_source=perception: a ponte não publica o mapa. '
+                'Quem monta bananas e poops é o perception_map, pela câmera.'
+            )
+        if self.publish_images:
+            self.create_timer(
+                1.0 / self.get_parameter('image_rate').value, self.publish_camera
+            )
         self.get_logger().info(
             f'ponte pronta. comandos em {self.resolve_topic_name("cmd_vel")}'
         )
@@ -263,6 +329,137 @@ class CoppeliaBridge(Node):
         self.banana_pub.publish(self.to_pose_array(bananas))
         self.poop_pub.publish(self.to_pose_array(poops))
 
+    def setup_camera(self, robot):
+        """Acha os sensores da Kinect e monta o CameraInfo a partir da cena."""
+        rgb = f"{robot}/{self.get_parameter('rgb_sensor').value}"
+        depth = f"{robot}/{self.get_parameter('depth_sensor').value}"
+        self.rgbHandle = self.find(rgb)
+        self.depthHandle = self.find(depth)
+
+        width, height = self.sim.getVisionSensorRes(self.rgbHandle)
+        # No CoppeliaSim o ângulo de perspectiva é o da maior dimensão da imagem.
+        angle = self.sim.getObjectFloatParam(
+            self.rgbHandle, self.sim.visionfloatparam_perspective_angle)
+        maior = max(width, height)
+        f = (maior / 2.0) / math.tan(angle / 2.0)
+        cx, cy = width / 2.0, height / 2.0
+
+        info = CameraInfo()
+        info.header.frame_id = self.camera_frame
+        info.width = width
+        info.height = height
+        info.distortion_model = 'plumb_bob'
+        info.d = [0.0, 0.0, 0.0, 0.0, 0.0]   # a câmera simulada não distorce
+        info.k = [f, 0.0, cx, 0.0, f, cy, 0.0, 0.0, 1.0]
+        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        info.p = [f, 0.0, cx, 0.0, 0.0, f, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        self.camera_info = info
+        self.near = self.sim.getObjectFloatParam(
+            self.depthHandle, self.sim.visionfloatparam_near_clipping)
+        self.far = self.sim.getObjectFloatParam(
+            self.depthHandle, self.sim.visionfloatparam_far_clipping)
+        # O referencial do sensor do CoppeliaSim é o referencial óptico do ROS
+        # girado 180° em torno do eixo óptico: medido nesta cena, o +x do sensor
+        # aponta para a esquerda da imagem e o +y para cima. Publicar a TF já
+        # com esse giro deixa camera_color_optical_frame ser um referencial
+        # óptico de verdade (x para a direita, y para baixo, z para a frente),
+        # e a projeção no yolo_vision fica a fórmula padrão.
+        pos = self.sim.getObjectPosition(self.rgbHandle, self.robotHandle)
+        qx, qy, qz, qw = self.sim.getObjectQuaternion(self.rgbHandle, self.robotHandle)
+        self.camera_pose = (pos, (qy, -qx, qw, -qz))
+        self.get_logger().info(
+            f'câmera {width}x{height}, f={f:.1f} px, profundidade de '
+            f'{self.near:.2f} a {self.far:.2f} m'
+        )
+
+    def publish_camera(self):
+        """Publica imagem colorida, profundidade e a TF do mesmo instante.
+
+        A TF sai daqui, e não do laço da pose, para carregar o mesmo carimbo de
+        tempo da imagem. Com o robô girando, usar a pose de outro instante joga
+        a detecção para o lado: a 0,5 rad/s, 100 ms de diferença já giram o
+        referencial 3°, o que a 2 m vira 10 cm de erro — e o mapa se enche de
+        cópias do mesmo objeto.
+        """
+        stamp = self.get_clock().now().to_msg()
+        if self.get_parameter('publish_tf').value:
+            x, y, _, quat = self.read_pose()
+            self.publish_transforms(x, y, quat, stamp)
+
+        data, (width, height) = self.sim.getVisionSensorImg(self.rgbHandle)
+        # flag 4: desvira a imagem, que o CoppeliaSim entrega de baixo para cima.
+        data = self.sim.transformImage(data, [width, height], 4)
+        rgb = Image()
+        rgb.header.stamp = stamp
+        rgb.header.frame_id = self.camera_frame
+        rgb.height, rgb.width = height, width
+        rgb.encoding = 'rgb8'
+        rgb.is_bigendian = 0
+        rgb.step = width * 3
+        rgb.data = data
+        self.rgb_pub.publish(rgb)
+
+        # O buffer vem normalizado de 0 (near) a 1 (far); aqui vira metro.
+        buf = self.sim.getVisionSensorDepthBuffer(
+            self.depthHandle + self.sim.handleflag_codedstring)
+        valores = self.sim.unpackFloatTable(buf)
+        metros = array.array(
+            'f', [self.near + v * (self.far - self.near) for v in valores])
+        # Mesma inversão vertical da imagem colorida, linha por linha.
+        linhas = [metros[i * width:(i + 1) * width] for i in range(height)]
+        invertido = array.array('f')
+        for linha in reversed(linhas):
+            invertido.extend(linha)
+
+        depth = Image()
+        depth.header.stamp = stamp
+        depth.header.frame_id = self.camera_frame
+        depth.height, depth.width = height, width
+        depth.encoding = '32FC1'
+        depth.is_bigendian = 0
+        depth.step = width * 4
+        depth.data = invertido.tobytes()
+        self.depth_pub.publish(depth)
+
+        self.camera_info.header.stamp = stamp
+        self.info_pub.publish(self.camera_info)
+
+    def publish_transforms(self, x, y, quat, stamp):
+        """TF mundo -> robô -> câmera, para o mapa sair no referencial do mundo.
+
+        A pose da câmera é lida da cena, então o referencial publicado é
+        exatamente o do sensor: o eixo z aponta para onde ele olha, e é nesse
+        referencial que o yolo_vision devolve os pontos.
+        """
+        base = TransformStamped()
+        base.header.stamp = stamp
+        base.header.frame_id = self.frame_id
+        base.child_frame_id = self.base_frame
+        base.transform.translation.x = x
+        base.transform.translation.y = y
+        base.transform.rotation.x = quat[0]
+        base.transform.rotation.y = quat[1]
+        base.transform.rotation.z = quat[2]
+        base.transform.rotation.w = quat[3]
+        envio = [base]
+
+        if self.camera_pose is not None:
+            # A câmera é fixa no robô: a pose dela foi lida uma vez, na partida.
+            pos, rot = self.camera_pose
+            cam = TransformStamped()
+            cam.header.stamp = stamp
+            cam.header.frame_id = self.base_frame
+            cam.child_frame_id = self.camera_frame
+            cam.transform.translation.x = pos[0]
+            cam.transform.translation.y = pos[1]
+            cam.transform.translation.z = pos[2]
+            cam.transform.rotation.x = rot[0]
+            cam.transform.rotation.y = rot[1]
+            cam.transform.rotation.z = rot[2]
+            cam.transform.rotation.w = rot[3]
+            envio.append(cam)
+        self.tf_broadcaster.sendTransform(envio)
+
     def to_pose_array(self, points):
         """Lista de (x, y) -> PoseArray, uma pose por ponto (orientação neutra)."""
         array = PoseArray()
@@ -277,20 +474,26 @@ class CoppeliaBridge(Node):
         return array
 
     def read_pose(self):
-        """(x, y, yaw) do robô no mundo, já no sentido do ROS.
+        """(x, y, yaw, quaternion) do robô no mundo.
 
         getObjectMatrix devolve a matriz 3x4 em ordem de linhas. A frente do
         robô nesta cena é o eixo +y dele, que é a segunda coluna da matriz:
         (m[1], m[5]). O yaw publicado é a direção desse eixo no mundo.
+
+        O quaternion é a rotação inteira do robô, tirada da mesma matriz. Ele
+        vai para a TF, e não o yaw: a TF precisa do referencial do robô como
+        ele é na cena, para que a pose da câmera, medida nesse referencial,
+        componha certo.
         """
         m = self.sim.getObjectMatrix(self.robotHandle, self.sim.handle_world)
-        return m[3], m[7], math.atan2(m[5], m[1])
+        return m[3], m[7], math.atan2(m[5], m[1]), matrix_to_quaternion(m)
 
     def step(self):
         """Executado pelo timer da pose: lê a cena e publica no ROS."""
-        x, y, yaw = self.read_pose()
+        x, y, yaw, quat = self.read_pose()
+        stamp = self.get_clock().now().to_msg()
         msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.stamp = stamp
         msg.header.frame_id = self.frame_id
         msg.pose.position.x = x
         msg.pose.position.y = y
@@ -298,6 +501,10 @@ class CoppeliaBridge(Node):
         msg.pose.orientation.z = math.sin(yaw / 2.0)
         msg.pose.orientation.w = math.cos(yaw / 2.0)
         self.pose_pub.publish(msg)
+
+        # Com a câmera ligada, a TF sai junto da imagem (ver publish_camera).
+        if self.get_parameter('publish_tf').value and not self.publish_images:
+            self.publish_transforms(x, y, quat, stamp)
 
     # =========================================================================
     #  ROS -> CoppeliaSim

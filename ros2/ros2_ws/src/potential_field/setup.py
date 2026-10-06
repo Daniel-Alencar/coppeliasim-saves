@@ -30,6 +30,8 @@ setup(
             'coppelia_bridge = potential_field.coppelia_bridge:main',
             'navigator = potential_field.navigator:main',
             'fake_world = potential_field.fake_world:main',
+            'yolo_vision = potential_field.yolo_vision:main',
+            'perception_map = potential_field.perception_map:main',
         ],
     },
 )
