@@ -1,0 +1,84 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 12
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/Map
+      Name: Mapa inflado (navigator)
+      Enabled: true
+      Topic:
+        Value: /inflated_map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color Scheme: costmap
+      Alpha: 0.5
+      Draw Behind: true
+    - Class: rviz_default_plugins/Map
+      Name: Mapa (SLAM Toolbox)
+      Enabled: true
+      Topic:
+        Value: /map
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color Scheme: map
+      Alpha: 0.7
+    - Class: rviz_default_plugins/LaserScan
+      Name: Laser
+      Enabled: true
+      Topic:
+        Value: /scan
+        Reliability Policy: Best Effort
+      Size (m): 0.04
+      Color Transformer: FlatColor
+      Color: 255; 0; 0
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Marker Scale: 0.4
+    - Class: rviz_default_plugins/PoseArray
+      Name: Bananas
+      Enabled: true
+      Topic:
+        Value: /bananas
+        Durability Policy: Transient Local
+      Shape: Arrow (Flat)
+      Color: 255; 220; 0
+    - Class: rviz_default_plugins/PointStamped
+      Name: Alvo
+      Enabled: true
+      Topic:
+        Value: /target
+      Color: 0; 200; 0
+      Radius: 0.12
+    - Class: rviz_default_plugins/Pose
+      Name: Gabarito
+      Enabled: true
+      Topic:
+        Value: /ground_truth
+      Shape: Axes
+      Axes Length: 0.3
+      Axes Radius: 0.02
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      Scale: 60
+      X: 0
+      Y: 0
+Window Geometry:
+  Width: 1200
+  Height: 900
