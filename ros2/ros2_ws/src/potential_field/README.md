@@ -106,12 +106,30 @@ YOLO deu e a confiança. No terminal 1 aparecem o mapa crescendo e as coletas:
 [perception_map]: banana recolhida em (0.59, 0.01); 1 no total
 ```
 
+### Fim da corrida
+
+Quando a cena recolhe **20 bananas** (o total que o `/buildScene` cria), a ponte
+para a simulação e o launch inteiro encerra sozinho:
+
+```
+[coppelia_bridge]: placar da cena: 20/20 bananas
+[coppelia_bridge]: 20 bananas recolhidas: meta atingida, parando a simulação
+```
+
+O critério é o **placar da cena**, e não a contagem do navegador. O robô às
+vezes passa por cima de uma banana que não era o alvo, e o navegador não fica
+sabendo — nos testes ele contou 16 quando a cena já tinha 19. O `/dirt_script`
+soma o ponto e manda a banana para z = 1000 no mesmo instante, então a ponte
+conta as bananas lá em cima. Isso só decide quando terminar: a navegação
+continua sem ver posição nenhuma da cena.
+
 ### Argumentos do launch
 
 | Argumento | Padrão | O que faz |
 |---|---|---|
 | `model` | `yolo11s.pt` | Modelo do ultralytics (nome ou caminho do `.pt`) |
 | `navigator` | `1` | `0` só percebe e mapeia, sem mover o robô |
+| `stop_after_bananas` | `20` | Para a simulação e encerra tudo ao recolher este número; `0` desliga |
 | `unknown_as_poop` | `true` | Detecção sem classe nem cor reconhecível vira obstáculo |
 | `wheel_radius` | `0.05` | Raio da roda (m) |
 | `wheel_separation` | `0.0` | Distância entre rodas (m); `0.0` mede na cena (0,2 m) |
@@ -289,6 +307,7 @@ parado.
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
 | `map_source` | `signals` | `perception` no launch da câmera: não publica o mapa dos sinais |
+| `stop_after_bananas` | `20` | Meta de bananas; atingida, a ponte para a simulação e o launch encerra |
 | `image_rate` | `5.0` | Imagens e TF por segundo (Hz) |
 | `wheel_radius` / `wheel_separation` | `0.05` / `0.0` | Geometria; `0.0` mede a separação na cena |
 | `motor_sign` | `-1.0` | Nesta cena, velocidade negativa leva o robô para a frente |

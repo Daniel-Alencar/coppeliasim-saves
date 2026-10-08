@@ -16,7 +16,7 @@ dos sinais 'banana' e 'poop' da cena: o mapa é construído pelo que o robô vê
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, Shutdown
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -47,6 +47,9 @@ def generate_launch_description():
     torch_threads_arg = DeclareLaunchArgument(
         'torch_threads', default_value='4',
         description='Threads do PyTorch; sem limite o YOLO tira CPU do simulador')
+    stop_after_arg = DeclareLaunchArgument(
+        'stop_after_bananas', default_value='20',
+        description='Para a simulação e encerra tudo ao recolher este número (0 desliga)')
     unknown_as_poop_arg = DeclareLaunchArgument(
         'unknown_as_poop', default_value='true',
         description='Tratar toda detecção que não é banana como obstáculo')
@@ -62,6 +65,7 @@ def generate_launch_description():
         wheel_radius_arg,
         wheel_separation_arg,
         torch_threads_arg,
+        stop_after_arg,
         unknown_as_poop_arg,
 
         Node(
@@ -79,7 +83,12 @@ def generate_launch_description():
                     LaunchConfiguration('wheel_radius'), value_type=float),
                 'wheel_separation': ParameterValue(
                     LaunchConfiguration('wheel_separation'), value_type=float),
-            }]
+                'stop_after_bananas': ParameterValue(
+                    LaunchConfiguration('stop_after_bananas'), value_type=int),
+            }],
+            # Quando a ponte sai (meta atingida ou Ctrl+C), o launch inteiro
+            # encerra junto, em vez de deixar os outros nós rodando sem simulador.
+            on_exit=Shutdown(reason='ponte encerrada'),
         ),
 
         Node(

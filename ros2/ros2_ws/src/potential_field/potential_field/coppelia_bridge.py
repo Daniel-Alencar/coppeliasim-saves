@@ -127,6 +127,16 @@ class CoppeliaBridge(Node):
         # deixa a simulação a 0,52x do tempo real; renderizando sob demanda, a
         # 5 Hz, ela vai a 0,94x. O tratamento original é restaurado ao sair.
         self.declare_parameter('render_on_demand', True)
+
+        # --- Fim da corrida --------------------------------------------------
+        # Parar a simulação quando a cena tiver recolhido este número de
+        # bananas (0 desliga). O critério é o placar da própria cena: o
+        # /dirt_script soma um ponto e manda a banana para z = 1000 no mesmo
+        # instante, então contar as bananas lá em cima é ler o placar. Isso só
+        # decide quando terminar; a navegação nunca vê essas posições.
+        self.declare_parameter('stop_after_bananas', 20)
+        self.declare_parameter('banana_alias', 'Banana')
+        self.declare_parameter('score_period', 1.0)   # [s] entre conferências
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
 
@@ -227,6 +237,10 @@ class CoppeliaBridge(Node):
         # caíam para 2,7 Hz — o robô girava ~40° entre um comando e outro.
         # O socket da Remote API não pode ser dividido entre threads, por isso
         # a segunda conexão.
+        self.done = threading.Event()   # placar atingido: a ponte encerra
+        self.banana_handles = []        # bananas da cena, achadas uma vez
+        self.last_score_check = 0.0
+        self.score = 0
         self.camera_stop = threading.Event()
         self.camera_thread = None
         if self.publish_images:
@@ -405,11 +419,44 @@ class CoppeliaBridge(Node):
             inicio = time.monotonic()
             try:
                 self.publish_camera()
+                self.check_score(self.sim_cam)
             except Exception as erro:   # simulação parando, conexão fechando
                 if not self.camera_stop.is_set():
                     self.get_logger().warn(
                         f'câmera: {erro}', throttle_duration_sec=5.0)
             self.camera_stop.wait(max(0.0, periodo - (time.monotonic() - inicio)))
+
+    def check_score(self, sim):
+        """Confere o placar da cena e, se a meta foi atingida, pede o fim."""
+        meta = self.get_parameter('stop_after_bananas').value
+        agora = time.monotonic()
+        if meta <= 0 or self.done.is_set() or \
+                agora - self.last_score_check < self.get_parameter('score_period').value:
+            return
+        self.last_score_check = agora
+
+        if not self.banana_handles:
+            # As bananas são criadas pelo /buildScene no play: procura uma vez.
+            alias = self.get_parameter('banana_alias').value
+            self.banana_handles = [
+                h for h in sim.getObjectsInTree(sim.handle_scene)
+                if sim.getObjectAlias(h) == alias
+            ]
+            if not self.banana_handles:
+                return
+            self.get_logger().info(
+                f'{len(self.banana_handles)} bananas na cena; a simulação para '
+                f'quando {meta} forem recolhidas')
+
+        placar = sum(1 for h in self.banana_handles
+                     if sim.getObjectPosition(h, sim.handle_world)[2] > 100.0)
+        if placar != self.score:
+            self.score = placar
+            self.get_logger().info(f'placar da cena: {placar}/{meta} bananas')
+        if placar >= min(meta, len(self.banana_handles)):
+            self.get_logger().info(
+                f'{placar} bananas recolhidas: meta atingida, parando a simulação')
+            self.done.set()
 
     def publish_camera(self):
         """Publica imagem colorida, profundidade e a TF do mesmo instante.
@@ -603,7 +650,7 @@ class CoppeliaBridge(Node):
             self.sim.setExplicitHandling(self.rgbHandle, self.original_handling[0])
             self.sim.setExplicitHandling(self.depthHandle, self.original_handling[1])
         self.write_motors(0.0, 0.0)
-        if self.started_here:
+        if self.started_here or self.done.is_set():
             self.sim.stopSimulation()
 
 
@@ -623,7 +670,7 @@ def main(args=None):
         rclpy.shutdown()
         return 1
     try:
-        while not stop_requested.is_set():
+        while not stop_requested.is_set() and not node.done.is_set():
             rclpy.spin_once(node, timeout_sec=0.1)
     finally:
         node.stop()
