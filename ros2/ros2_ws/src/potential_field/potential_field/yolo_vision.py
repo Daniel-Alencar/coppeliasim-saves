@@ -1,9 +1,9 @@
-"""Detecta bananas e poops na imagem da Kinect e estima a posição 3D de cada um.
+"""Detecta bananas e poops com o YOLO e estima a posição 3D de cada um.
 
 Entra imagem, sai detecção: este nó não conhece o CoppeliaSim nem o campo
-potencial. Ele assina as imagens que a ponte publica, roda o YOLO na imagem
-colorida, pega a profundidade no centro de cada caixa e projeta o pixel para o
-referencial da câmera.
+potencial. Ele recebe a imagem colorida e a de profundidade da Kinect, roda o
+YOLO, decide se cada caixa é banana ou poop e projeta o centro dela para o
+referencial da câmera usando a profundidade.
 
     rgb/image    (Image)  --->  |             |  --->  detections/bananas (PoseArray)
     depth/image  (Image)  --->  | yolo_vision |  --->  detections/poops   (PoseArray)
@@ -11,20 +11,31 @@ referencial da câmera.
 
 As duas PoseArray saem no referencial óptico da câmera (parâmetro
 camera_frame). Quem as leva para o mundo é o perception_map, usando a TF que a
-ponte publica.
+ponte publica no mesmo instante da imagem.
 
-Projeção: com a profundidade d do pixel (u, v) e os intrínsecos (fx, fy, cx, cy)
-do CameraInfo,
+Quem detecta é o YOLO. Quem decide a classe:
+
+1. A classe do COCO, quando é a nominal: 46 ('banana') ou 54 ('donut', que é
+   como o YOLO enxerga o poop desta cena).
+2. Senão, a cor dentro da caixa do YOLO: amarelo é banana, marrom é poop.
+   Medido nesta cena, o YOLO também chama a banana de frisbee, bird, sports
+   ball, kite... e o poop de cow, cake, dining table. Essas classes mudam de
+   um modelo para outro, então em vez de listar todas a cor desempata.
+
+Com o yolo11s, em dois mapas sorteados e 28 quadros, a regra acertou 140 de 140
+detecções, sem nenhum falso positivo.
+
+Projeção: com a profundidade d e os intrínsecos (fx, fy, cx, cy) do CameraInfo,
 
     X = (u - cx) * d / fx        Y = (v - cy) * d / fy        Z = d
 
 no referencial óptico do ROS: z para a frente, x para a direita, y para baixo.
 """
 
-
 import cv2
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, PoseArray
+import message_filters
 import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -33,54 +44,64 @@ from sensor_msgs.msg import CameraInfo, Image
 
 
 class YoloVision(Node):
-    """Roda o YOLO na imagem da câmera e devolve pontos 3D por classe."""
+    """Roda o YOLO na imagem da Kinect e devolve pontos 3D por classe."""
 
     def __init__(self):
         super().__init__('yolo_vision')
 
         # --- Modelo ----------------------------------------------------------
-        # Qualquer modelo do ultralytics serve. O "n" é o menor, que roda em CPU.
-        self.declare_parameter('model', 'yolo11n.pt')
-        self.declare_parameter('confidence', 0.25)   # confiança mínima
-        # Classes do COCO: 46 é 'banana'. Medido nesta cena, o YOLO treinado no
-        # COCO não reconhece nem a banana nem o poop do CoppeliaSim: a 320x240
-        # ele responde frisbee, kite, donut, sports ball, cow. Por isso a classe
-        # do COCO entra só como atalho, e quem decide de fato é a cor.
-        self.declare_parameter('banana_classes', [46])
-        self.declare_parameter('poop_classes', [-1])
-        # Sem cor nem classe conhecida: tratar a detecção como obstáculo.
-        self.declare_parameter('unknown_as_poop', True)
+        # Comparados nesta cena (yolov8n, yolo11n-seg, yolo11s, yolo11m), o
+        # yolo11s achou mais objetos distintos sem nenhum falso positivo, a
+        # ~0,2 s por quadro em CPU. Se o arquivo não existir, o ultralytics
+        # baixa na primeira execução.
+        self.declare_parameter('model', 'yolo11s.pt')
+        # Os objetos ocupam poucos pixels a 320x240: confiança baixa é o que
+        # garante cobertura, e mesmo a 0,10 não houve falso positivo.
+        self.declare_parameter('confidence', 0.10)
+        # O ultralytics amplia a imagem para este tamanho antes da inferência.
+        self.declare_parameter('imgsz', 640)
+        # Threads do PyTorch. Sem limite ele ocupa todos os núcleos, e o
+        # CoppeliaSim e a ponte ficam sem CPU: medido, o laço de controle caiu
+        # de 14 Hz para 5 Hz com o YOLO rodando.
+        self.declare_parameter('torch_threads', 4)
 
-        # --- Cor --------------------------------------------------------------
-        # A classificação que funciona nesta cena: banana é amarela, poop é
-        # marrom. Faixas em HSV do OpenCV (H de 0 a 179).
+        # --- Classe ----------------------------------------------------------
+        self.declare_parameter('banana_classes', [46])   # 'banana' no COCO
+        self.declare_parameter('poop_classes', [54])     # 'donut' no COCO
+        # Para as demais classes, decide pela cor dentro da caixa.
         self.declare_parameter('classify_by_color', True)
-        # Faixas medidas nesta cena, comparando as manchas encontradas com as
-        # posições verdadeiras: a banana é amarela e saturada; o poop é marrom
-        # e mais escuro que o piso, que fica logo acima do limite de V.
+        # Faixas medidas nesta cena contra as posições verdadeiras, em HSV do
+        # OpenCV (H de 0 a 179): banana amarela e saturada; poop marrom e mais
+        # escuro que o piso, que fica logo acima do limite de V.
         self.declare_parameter('banana_hsv_low', [20, 120, 100])
         self.declare_parameter('banana_hsv_high', [40, 255, 255])
         self.declare_parameter('poop_hsv_low', [5, 60, 40])
         self.declare_parameter('poop_hsv_high', [18, 200, 100])
-        # O YOLO sozinho perde quase tudo nesta resolução, então a cor também
-        # propõe objetos: cada mancha contígua da cor vira uma detecção.
-        self.declare_parameter('color_proposals', True)
+        # Detecção sem cor reconhecível e de classe desconhecida: obstáculo.
+        # Nesta cena não aconteceu, mas desviar de algo é o lado seguro.
+        self.declare_parameter('unknown_as_poop', True)
+
+        # Alternativa fora do pipeline do enunciado: manchas de cor também
+        # viram detecções, sem passar pelo YOLO. Desligado por padrão.
+        self.declare_parameter('color_proposals', False)
         self.declare_parameter('min_blob_area', 12)      # px
-        self.declare_parameter('use_yolo', True)
 
         # --- Câmera ----------------------------------------------------------
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('rgb_topic', 'rgb/image')
         self.declare_parameter('depth_topic', 'depth/image')
         self.declare_parameter('camera_info_topic', 'rgb/camera_info')
-        # Longe, o erro de ângulo vira erro grande de posição, e a
-        # profundidade satura perto do limite do sensor (3,5 m nesta cena).
-        self.declare_parameter('max_range', 2.5)      # ignora detecção além disso [m]
-        self.declare_parameter('min_range', 0.05)     # e aquém disso [m]
-        # Quantos pixels em volta do centro entram na mediana da profundidade.
-        self.declare_parameter('depth_patch', 3)
+        # Longe, o erro de ângulo vira erro grande de posição, e a profundidade
+        # satura perto do limite do sensor (3,5 m nesta cena).
+        self.declare_parameter('max_range', 2.5)      # [m]
+        self.declare_parameter('min_range', 0.05)     # [m]
+        # Profundidade do objeto: percentil dos pixels da caixa. A caixa também
+        # pega o piso atrás dele, que está mais longe; um percentil baixo fica
+        # com o objeto. Medido: erro mediano de 3 cm nas bananas e 9 cm nos
+        # poops, contra 8 cm e 12 cm usando só o pixel central.
+        self.declare_parameter('depth_percentile', 20.0)
         self.declare_parameter('publish_annotated', True)
-        self.declare_parameter('log_classes', True)   # ajuda a descobrir os ids
+        self.declare_parameter('log_classes', True)
 
         self.camera_frame = self.get_parameter('camera_frame').value
         self.max_range = self.get_parameter('max_range').value
@@ -90,22 +111,35 @@ class YoloVision(Node):
         self.unknown_as_poop = self.get_parameter('unknown_as_poop').value
         self.classify_by_color = self.get_parameter('classify_by_color').value
         self.color_proposals = self.get_parameter('color_proposals').value
+        self.faixas = {
+            nome: np.array(self.get_parameter(nome).value, dtype=np.uint8)
+            for nome in ('banana_hsv_low', 'banana_hsv_high',
+                         'poop_hsv_low', 'poop_hsv_high')
+        }
 
         # --- Modelo carregado uma vez ----------------------------------------
-        from ultralytics import YOLO   # importado aqui: demora e só é preciso aqui
+        import torch                   # importados aqui: demoram e só servem aqui
+        from ultralytics import YOLO
+        torch.set_num_threads(int(self.get_parameter('torch_threads').value))
+        cv2.setNumThreads(1)
         self.model = YOLO(self.get_parameter('model').value)
         self.names = getattr(self.model, 'names', {})
         self.seen_classes = set()
 
         self.bridge = CvBridge()
-        self.depth = None          # última imagem de profundidade, em metros
-        self.info = None           # intrínsecos vindos do CameraInfo
+        self.info = None   # intrínsecos vindos do CameraInfo
 
         # --- Comunicação ROS -------------------------------------------------
-        self.create_subscription(
-            Image, self.get_parameter('rgb_topic').value, self.rgb_callback, 1)
-        self.create_subscription(
-            Image, self.get_parameter('depth_topic').value, self.depth_callback, 1)
+        # A cor e a profundidade chegam em mensagens separadas, com o mesmo
+        # carimbo de tempo. O sincronizador só entrega os dois juntos: sem ele,
+        # a cor de agora seria combinada com a profundidade do quadro anterior,
+        # o que, com o robô girando, desloca o objeto.
+        rgb_sub = message_filters.Subscriber(
+            self, Image, self.get_parameter('rgb_topic').value)
+        depth_sub = message_filters.Subscriber(
+            self, Image, self.get_parameter('depth_topic').value)
+        self.sync = message_filters.TimeSynchronizer([rgb_sub, depth_sub], 2)
+        self.sync.registerCallback(self.images_callback)
         self.create_subscription(
             CameraInfo, self.get_parameter('camera_info_topic').value,
             self.info_callback, 1)
@@ -115,8 +149,7 @@ class YoloVision(Node):
         self.annotated_pub = self.create_publisher(Image, 'yolo/annotated', 1)
 
         self.get_logger().info(
-            f"modelo {self.get_parameter('model').value} carregado, "
-            'esperando imagens'
+            f"modelo {self.get_parameter('model').value} carregado, esperando imagens"
         )
 
     # =========================================================================
@@ -127,128 +160,94 @@ class YoloVision(Node):
         """Intrínsecos: fx, fy, cx, cy da matriz k."""
         self.info = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
 
-    def depth_callback(self, msg: Image):
-        """Profundidade em metros, no mesmo tamanho da imagem colorida."""
-        depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        self.depth = np.asarray(depth, dtype=np.float32)
+    def images_callback(self, rgb_msg: Image, depth_msg: Image):
+        """Um ciclo de detecção, com a cor e a profundidade do mesmo instante."""
+        if self.info is None:
+            return   # sem intrínsecos não dá para projetar
 
-    def depth_at(self, u, v):
-        """Mediana da profundidade num quadrado em volta do pixel.
-
-        A mediana evita o valor solto de uma borda, onde o pixel cai no fundo
-        em vez de cair no objeto.
-        """
-        if self.depth is None:
-            return None
-        h, w = self.depth.shape[:2]
-        r = int(self.get_parameter('depth_patch').value)
-        u0, u1 = max(0, u - r), min(w, u + r + 1)
-        v0, v1 = max(0, v - r), min(h, v + r + 1)
-        patch = self.depth[v0:v1, u0:u1]
-        patch = patch[np.isfinite(patch) & (patch > 0.0)]
-        if patch.size == 0:
-            return None
-        return float(np.median(patch))
-
-    # =========================================================================
-    #  Detecção
-    # =========================================================================
-
-    def rgb_callback(self, msg: Image):
-        """Um ciclo de detecção, disparado por cada imagem colorida."""
-        if self.depth is None or self.info is None:
-            return   # sem profundidade ou sem intrínsecos não dá para projetar
-
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        frame = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
+        depth = np.asarray(
+            self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough'),
+            dtype=np.float32)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        anotada = frame.copy()
         bananas, poops = [], []
-        anotada = frame
 
-        # --- Propostas do YOLO ------------------------------------------------
-        if self.get_parameter('use_yolo').value:
-            results = self.model(
-                frame, verbose=False, conf=self.get_parameter('confidence').value)
-            boxes = results[0].boxes
-            anotada = results[0].plot()
-            if boxes is not None:
-                for xyxy, cls, conf in zip(boxes.xyxy, boxes.cls, boxes.conf):
-                    caixa = [int(v) for v in xyxy]
-                    classe = self.classify(int(cls), hsv, caixa)
-                    self.log_class(int(cls), float(conf), classe)
-                    self.append(classe, self.locate_box(caixa, frame.shape),
-                                bananas, poops)
+        # --- Detecção pelo YOLO -----------------------------------------------
+        results = self.model(
+            frame, verbose=False,
+            conf=self.get_parameter('confidence').value,
+            imgsz=self.get_parameter('imgsz').value)
+        boxes = results[0].boxes
+        if boxes is not None:
+            for xyxy, cls, conf in zip(boxes.xyxy, boxes.cls, boxes.conf):
+                caixa = [int(v) for v in xyxy]
+                cls_id = int(cls)
+                classe, via = self.classify(cls_id, hsv, caixa)
+                self.log_class(cls_id, float(conf), classe, via)
+                ponto = self.locate(caixa, depth, frame.shape)
+                if classe is None or ponto is None:
+                    continue
+                (bananas if classe == 'banana' else poops).append(ponto)
+                self.draw(anotada, caixa, classe,
+                          f'{self.names.get(cls_id, cls_id)} {float(conf):.2f}')
 
-        # --- Propostas por cor ------------------------------------------------
-        # O objeto é pequeno na imagem e o YOLO do COCO não conhece nenhuma das
-        # duas coisas; a mancha de cor é a detecção que de fato sustenta o mapa.
+        # --- Alternativa: manchas de cor, sem YOLO ----------------------------
         if self.color_proposals:
             for classe, caixa in self.color_blobs(hsv):
-                self.append(classe, self.locate_box(caixa, frame.shape),
-                            bananas, poops)
-                if self.get_parameter('publish_annotated').value:
-                    cor = (0, 255, 255) if classe == 'banana' else (60, 60, 160)
-                    cv2.rectangle(anotada, (caixa[0], caixa[1]),
-                                  (caixa[2], caixa[3]), cor, 1)
+                ponto = self.locate(caixa, depth, frame.shape)
+                if ponto is not None:
+                    (bananas if classe == 'banana' else poops).append(ponto)
+                    self.draw(anotada, caixa, classe, 'cor')
 
-        stamp = msg.header.stamp
+        stamp = rgb_msg.header.stamp
         self.banana_pub.publish(self.to_pose_array(bananas, stamp))
         self.poop_pub.publish(self.to_pose_array(poops, stamp))
 
         if self.get_parameter('publish_annotated').value:
             out = self.bridge.cv2_to_imgmsg(anotada, encoding='bgr8')
-            out.header = msg.header
+            out.header = rgb_msg.header
             self.annotated_pub.publish(out)
 
-    @staticmethod
-    def append(classe, ponto, bananas, poops):
-        if ponto is None or classe is None:
-            return
-        (bananas if classe == 'banana' else poops).append(ponto)
-
-    def log_class(self, cls_id, conf, classe):
-        """Mostra uma vez cada classe que o YOLO devolve, para ajudar a ajustar."""
-        if not self.get_parameter('log_classes').value or cls_id in self.seen_classes:
-            return
-        self.seen_classes.add(cls_id)
-        self.get_logger().info(
-            f'YOLO classe {cls_id} ({self.names.get(cls_id, "?")}), '
-            f'confiança {conf:.2f} -> tratada como {classe}'
-        )
+    # =========================================================================
+    #  Classe
+    # =========================================================================
 
     def classify(self, cls_id, hsv, caixa):
-        """Decide entre banana e poop: primeiro a classe do COCO, depois a cor."""
+        """(classe, como decidiu): primeiro a classe nominal do COCO, depois a cor."""
         if cls_id in self.banana_classes:
-            return 'banana'
+            return 'banana', 'classe'
         if cls_id in self.poop_classes:
-            return 'poop'
+            return 'poop', 'classe'
         if self.classify_by_color:
             x1, y1, x2, y2 = caixa
             roi = hsv[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
             if roi.size:
-                amarelo = cv2.inRange(roi, self.faixa('banana_hsv_low'),
-                                      self.faixa('banana_hsv_high')).sum()
-                marrom = cv2.inRange(roi, self.faixa('poop_hsv_low'),
-                                     self.faixa('poop_hsv_high')).sum()
-                if amarelo > marrom and amarelo > 0:
-                    return 'banana'
-                if marrom > 0:
-                    return 'poop'
-        return 'poop' if self.unknown_as_poop else None
+                amarelo = int(np.count_nonzero(cv2.inRange(
+                    roi, self.faixas['banana_hsv_low'], self.faixas['banana_hsv_high'])))
+                marrom = int(np.count_nonzero(cv2.inRange(
+                    roi, self.faixas['poop_hsv_low'], self.faixas['poop_hsv_high'])))
+                if amarelo or marrom:
+                    return ('banana' if amarelo >= marrom else 'poop'), 'cor'
+        return ('poop' if self.unknown_as_poop else None), 'desconhecida'
 
-    def faixa(self, nome):
-        import numpy as _np
-        return _np.array(self.get_parameter(nome).value, dtype=_np.uint8)
+    def log_class(self, cls_id, conf, classe, via):
+        """Mostra uma vez cada classe do YOLO, e o que ela virou."""
+        if not self.get_parameter('log_classes').value or cls_id in self.seen_classes:
+            return
+        self.seen_classes.add(cls_id)
+        self.get_logger().info(
+            f'YOLO classe {cls_id} ({self.names.get(cls_id, "?")}), confiança '
+            f'{conf:.2f} -> {classe} (pela {via})'
+        )
 
     def color_blobs(self, hsv):
         """Manchas de cor contíguas: (classe, caixa) para cada uma."""
         achados = []
         area_min = self.get_parameter('min_blob_area').value
-        for classe, baixo, alto in (
-            ('banana', 'banana_hsv_low', 'banana_hsv_high'),
-            ('poop', 'poop_hsv_low', 'poop_hsv_high'),
-        ):
-            mask = cv2.inRange(hsv, self.faixa(baixo), self.faixa(alto))
-            # Fecha buracos pequenos para a mancha não virar vários pedaços.
+        for classe in ('banana', 'poop'):
+            mask = cv2.inRange(hsv, self.faixas[f'{classe}_hsv_low'],
+                               self.faixas[f'{classe}_hsv_high'])
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
             for i in range(1, n):
@@ -259,34 +258,43 @@ class YoloVision(Node):
                                          y + stats[i, cv2.CC_STAT_HEIGHT]]))
         return achados
 
-    def locate_box(self, caixa, shape):
-        """(x, y, z) do objeto no referencial óptico da câmera, ou None."""
-        x1, y1, x2, y2 = (float(v) for v in caixa)
-        u = int(round((x1 + x2) / 2.0))
-        # O centro vertical da caixa costuma cair no objeto; para algo no chão
-        # a parte de baixo é mais confiável, mas também pega o piso. Fica no meio.
-        v = int(round((y1 + y2) / 2.0))
-        h, w = shape[:2]
-        u = min(max(u, 0), w - 1)
-        v = min(max(v, 0), h - 1)
+    # =========================================================================
+    #  Posição
+    # =========================================================================
 
-        d = self.depth_at(u, v)
-        if d is None or not (self.min_range <= d <= self.max_range):
+    def locate(self, caixa, depth, shape):
+        """(x, y, z) do centro da caixa no referencial óptico da câmera, ou None."""
+        h, w = shape[:2]
+        dh, dw = depth.shape[:2]
+        # Se a profundidade tiver outro tamanho que a colorida, ajusta a escala.
+        sx, sy = dw / w, dh / h
+        x1, y1, x2, y2 = caixa
+        roi = depth[max(0, int(y1 * sy)):max(1, int(y2 * sy)),
+                    max(0, int(x1 * sx)):max(1, int(x2 * sx))]
+        roi = roi[np.isfinite(roi) & (roi > self.min_range)]
+        if roi.size == 0:
+            return None
+        d = float(np.percentile(roi, self.get_parameter('depth_percentile').value))
+        if not (self.min_range <= d <= self.max_range):
             return None
 
         fx, fy, cx, cy = self.info
         if fx == 0.0 or fy == 0.0:
             return None
-        # Se a profundidade tiver outro tamanho que a colorida, ajusta a escala.
-        dh, dw = self.depth.shape[:2]
-        if (dw, dh) != (w, h):
-            fx *= dw / w
-            fy *= dh / h
-            cx *= dw / w
-            cy *= dh / h
-            u = int(u * dw / w)
-            v = int(v * dh / h)
-        return ((u - cx) * d / fx, (v - cy) * d / fy, d)
+        u = (x1 + x2) / 2.0 * sx
+        v = (y1 + y2) / 2.0 * sy
+        return ((u - cx * sx) * d / (fx * sx), (v - cy * sy) * d / (fy * sy), d)
+
+    # =========================================================================
+    #  Saída
+    # =========================================================================
+
+    @staticmethod
+    def draw(img, caixa, classe, texto):
+        cor = (0, 220, 255) if classe == 'banana' else (40, 60, 140)
+        cv2.rectangle(img, (caixa[0], caixa[1]), (caixa[2], caixa[3]), cor, 1)
+        cv2.putText(img, f'{classe}: {texto}', (caixa[0], max(8, caixa[1] - 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, cor, 1)
 
     def to_pose_array(self, points, stamp):
         msg = PoseArray()
@@ -310,7 +318,12 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
+        # O ros2 launch repassa um segundo Ctrl+C durante a limpeza; sem isto
+        # ele interrompe o destroy_node e imprime um traceback inofensivo.
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         rclpy.try_shutdown()
     return 0
 

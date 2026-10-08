@@ -76,11 +76,29 @@ class PotentialFieldNavigator(Node):
         # fica ruim e o mapa enche de cópias do mesmo objeto.
         self.declare_parameter('search_w', 0.4)          # giro da varredura [rad/s]
         self.declare_parameter('search_v', 0.18)         # avanço da varredura [m/s]
-        self.declare_parameter('search_spin_time', 8.0)  # tempo girando [s]
+        # 16 s a 0,4 rad/s dá uma volta inteira: a câmera vê o entorno todo.
+        self.declare_parameter('search_spin_time', 16.0)  # tempo girando [s]
         self.declare_parameter('search_move_time', 3.0)  # tempo andando [s]
         self.declare_parameter('search_timeout', 120.0)  # desiste depois disso [s]
         # Distância para considerar que duas bananas do mapa são a mesma.
         self.declare_parameter('map_tolerance', 0.20)    # [m]
+        # Banana que some do mapa com o robô a menos disto foi recolhida por
+        # ele (o perception_map a retira quando o robô passa por cima).
+        self.declare_parameter('vanish_collect_radius', 0.35)  # [m]
+
+        # --- Alvo inalcançável -----------------------------------------------
+        # Um alvo pode ser impossível: um poop (ou uma cópia dele no mapa) em
+        # cima da banana, ou um poop classificado como banana. O campo empata
+        # para sempre nesse ponto. Medido: sem esta regra o robô passou os
+        # últimos 90 s de uma corrida de 4 min contornando o mesmo alvo, com 7
+        # bananas conhecidas esperando.
+        self.declare_parameter('max_swirls_per_target', 4)  # empates até desistir
+        self.declare_parameter('target_timeout', 40.0)      # tempo máximo num alvo [s]
+        self.declare_parameter('skip_time', 60.0)           # quanto tempo fica pulado [s]
+        # Escolha do alvo: além da distância, cada poop a menos de d0_poop do
+        # segmento robô-banana soma esta penalidade. Prefere bananas com o
+        # caminho livre; a trajetória continua saindo das forças.
+        self.declare_parameter('blocked_penalty', 1.0)      # [m por poop]
 
         # --- Mínimos locais --------------------------------------------------
         # O campo pode empatar: a repulsão dos poops cancela a atração e o robô
@@ -102,6 +120,10 @@ class PotentialFieldNavigator(Node):
         self.reset_progress()
         self.swirl_sign = 1.0   # para que lado a tangencial desvia
         self.gone = []          # bananas que este nó já deu por coletadas
+        self.robot_xy = None    # última posição do robô, para o mapa
+        self.skipped = {}       # alvo -> até quando fica pulado
+        self.target_since = None   # quando o alvo atual foi escolhido
+        self.swirls_on_target = 0  # empates no alvo atual
         self.search_since = None   # quando a busca começou
         self.search_phase = None   # ('spin' | 'move', instante em que começou)
 
@@ -150,6 +172,15 @@ class PotentialFieldNavigator(Node):
 
         self.bananas = bananas
         self.pending = [b for b in self.pending if b not in sumiram] + novas
+        # Sumiu com o robô do lado: foi ele que passou por cima e a recolheu.
+        raio = self.get_parameter('vanish_collect_radius').value
+        for b in sumiram:
+            if self.robot_xy and math.hypot(b[0] - self.robot_xy[0],
+                                            b[1] - self.robot_xy[1]) <= raio:
+                self.gone.append(b)
+                self.collected += 1
+                self.collected_pub.publish(Int32(data=self.collected))
+                self.get_logger().info(f'banana {self.collected} recolhida')
         if self.target is not None and self.target in sumiram:
             self.target = None
             self.reset_progress()
@@ -178,13 +209,49 @@ class PotentialFieldNavigator(Node):
     #  Alvo
     # =========================================================================
 
-    def choose_target(self, x, y):
-        """Banana pendente mais próxima. Só o alvo atual atrai o robô."""
-        if not self.pending:
+    def choose_target(self, x, y, now):
+        """Banana pendente de menor custo. Só o alvo atual atrai o robô.
+
+        Custo = distância + blocked_penalty por poop perto do segmento até ela.
+        Bananas puladas (ver give_up) ficam de fora até skip_time passar.
+        """
+        self.skipped = {b: ate for b, ate in self.skipped.items() if ate > now}
+        candidatas = [b for b in self.pending if b not in self.skipped]
+        if not candidatas:
             return None
-        return min(self.pending, key=lambda b: math.hypot(b[0] - x, b[1] - y))
+        d0 = self.get_parameter('d0_poop').value
+        penalidade = self.get_parameter('blocked_penalty').value
+
+        def custo(b):
+            bloqueios = sum(1 for p in self.poops
+                            if self.dist_to_segment(p, (x, y), b) < d0)
+            return math.hypot(b[0] - x, b[1] - y) + penalidade * bloqueios
+        return min(candidatas, key=custo)
+
+    @staticmethod
+    def dist_to_segment(p, a, b):
+        """Distância do ponto p ao segmento ab."""
+        ax, ay = a
+        dx, dy = b[0] - ax, b[1] - ay
+        comp = dx * dx + dy * dy
+        t = 0.0
+        if comp > 1e-9:
+            t = max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / comp))
+        return math.hypot(p[0] - (ax + t * dx), p[1] - (ay + t * dy))
+
+    def give_up(self, now, motivo):
+        """Pula o alvo atual por skip_time e libera a escolha de outro."""
+        self.skipped[self.target] = now + self.get_parameter('skip_time').value
+        self.get_logger().info(
+            f'desisti da banana em ({self.target[0]:.2f}, {self.target[1]:.2f}): '
+            f'{motivo}; tento de novo em {self.get_parameter("skip_time").value:.0f} s'
+        )
+        self.target = None
+        self.reset_progress()
 
     def reset_progress(self):
+        self.target_since = None
+        self.swirls_on_target = 0
         self.best_distance = math.inf   # menor distância já obtida do alvo
         self.stall_since = None         # desde quando não há progresso
         self.swirl_until = -math.inf    # até quando a tangencial fica ligada
@@ -256,6 +323,7 @@ class PotentialFieldNavigator(Node):
             if now > self.swirl_until:
                 self.swirl_sign = self.pick_side(ax, ay, rx, ry)
                 self.swirl_until = now + swirl_time
+                self.swirls_on_target += 1
                 self.get_logger().info('campo empatado, contornando pela tangente')
             self.stall_since = None
             self.best_distance = distance
@@ -298,6 +366,7 @@ class PotentialFieldNavigator(Node):
 
         x = msg.pose.position.x
         y = msg.pose.position.y
+        self.robot_xy = (x, y)
         theta = yaw_of(msg.pose)
         now = self.get_clock().now().nanoseconds / 1e9
 
@@ -318,8 +387,9 @@ class PotentialFieldNavigator(Node):
                 self.reset_progress()
 
         if self.target is None:
-            self.target = self.choose_target(x, y)
+            self.target = self.choose_target(x, y, now)
             self.reset_progress()
+            self.target_since = now
             if self.target is None:
                 # Nenhuma banana conhecida. Com o mapa vindo dos sinais isso é
                 # o fim; com o mapa vindo da câmera, é hora de procurar.
@@ -334,6 +404,15 @@ class PotentialFieldNavigator(Node):
                 return
         self.search_phase = None
         self.search_since = None
+
+        # --- Desistir de alvo inalcançável ------------------------------------
+        if self.swirls_on_target >= self.get_parameter('max_swirls_per_target').value:
+            self.give_up(now, f'{self.swirls_on_target} empates seguidos')
+            return
+        if (self.target_since is not None and
+                now - self.target_since > self.get_parameter('target_timeout').value):
+            self.give_up(now, 'tempo esgotado')
+            return
 
         self.publish_target(msg.header.frame_id)
 
@@ -477,7 +556,12 @@ def main(args=None):
     finally:
         if rclpy.ok():
             node.stop()
-        node.destroy_node()
+        # O ros2 launch repassa um segundo Ctrl+C durante a limpeza; sem isto
+        # ele interrompe o destroy_node e imprime um traceback inofensivo.
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         rclpy.try_shutdown()
 
 

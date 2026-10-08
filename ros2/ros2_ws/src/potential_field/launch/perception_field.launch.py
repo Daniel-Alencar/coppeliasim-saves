@@ -34,15 +34,19 @@ def generate_launch_description():
         'navigator', default_value='1',
         description='1 sobe o navegador; 0 só percebe, sem mover o robô')
     model_arg = DeclareLaunchArgument(
-        'model', default_value='yolo11n.pt',
-        description='Modelo do ultralytics usado na detecção')
+        'model', default_value='yolo11s.pt',
+        description='Modelo do ultralytics; baixado na primeira execução se faltar')
+    # Mesmos padrões da ponte: raio medido no modelo da cena (cilindro de 0,1 m
+    # de diâmetro) e separação medida entre os dois motores ao iniciar.
     wheel_radius_arg = DeclareLaunchArgument(
-        'wheel_radius', default_value='0.0975',
-        description='Raio da roda (m). Medido nesta cena: 0.05')
+        'wheel_radius', default_value='0.05',
+        description='Raio da roda (m), medido na cena')
     wheel_separation_arg = DeclareLaunchArgument(
-        'wheel_separation', default_value='0.331',
-        description='Distância entre rodas (m). Medida nesta cena: 0.2; '
-                    '0.0 mede na própria cena')
+        'wheel_separation', default_value='0.0',
+        description='Distância entre rodas (m); 0.0 mede na própria cena (0,2 m)')
+    torch_threads_arg = DeclareLaunchArgument(
+        'torch_threads', default_value='4',
+        description='Threads do PyTorch; sem limite o YOLO tira CPU do simulador')
     unknown_as_poop_arg = DeclareLaunchArgument(
         'unknown_as_poop', default_value='true',
         description='Tratar toda detecção que não é banana como obstáculo')
@@ -57,6 +61,7 @@ def generate_launch_description():
         model_arg,
         wheel_radius_arg,
         wheel_separation_arg,
+        torch_threads_arg,
         unknown_as_poop_arg,
 
         Node(
@@ -85,6 +90,8 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'model': LaunchConfiguration('model'),
+                'torch_threads': ParameterValue(
+                    LaunchConfiguration('torch_threads'), value_type=int),
                 'unknown_as_poop': ParameterValue(
                     LaunchConfiguration('unknown_as_poop'), value_type=bool),
             }]

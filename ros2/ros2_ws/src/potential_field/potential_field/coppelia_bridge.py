@@ -35,7 +35,6 @@ parâmetro motor_sign (-1.0) resolve. Esse script precisa estar DESABILITADO:
 ele escreve nos motores a cada passo de simulação e anula o cmd_vel.
 """
 
-import array       # buffer de profundidade, float por pixel
 import math        # math.dist, math.hypot, math.sin/cos
 import signal      # tratamento manual do Ctrl+C (SIGINT) e do SIGTERM
 import threading   # threading.Event: flag de parada segura entre sinal e laço
@@ -44,6 +43,7 @@ import time        # time.monotonic: relógio que nunca volta, ideal para prazos
 # Coppelia ZeroMQ Remote API: chama as funções sim.* a partir de outro processo.
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped, TransformStamped, Twist
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -122,6 +122,11 @@ class CoppeliaBridge(Node):
         self.declare_parameter('rgb_sensor', 'kinect/rgb')     # relativo ao robô
         self.declare_parameter('depth_sensor', 'kinect/depth')
         self.declare_parameter('image_rate', 5.0)              # [Hz]
+        # A Kinect da cena renderiza a cada passo (20 vezes por segundo), mas a
+        # ponte só usa image_rate imagens por segundo. Medido: só a renderização
+        # deixa a simulação a 0,52x do tempo real; renderizando sob demanda, a
+        # 5 Hz, ela vai a 0,94x. O tratamento original é restaurado ao sair.
+        self.declare_parameter('render_on_demand', True)
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
 
@@ -175,6 +180,8 @@ class CoppeliaBridge(Node):
 
         # --- Estado interno --------------------------------------------------
         self.velocity = (0.0, 0.0)   # (esquerda, direita) em m/s na roda
+        self.last_written = (None, None)  # último comando escrito nas juntas
+        self.last_write_time = 0.0
         self.deadline = 0.0          # instante em que o último cmd_vel expira
         self.map_warned = False      # já avisou que os sinais não existem?
         self.map_seen = (None, None)  # último mapa publicado, para não repetir log
@@ -214,10 +221,20 @@ class CoppeliaBridge(Node):
                 'map_source=perception: a ponte não publica o mapa. '
                 'Quem monta bananas e poops é o perception_map, pela câmera.'
             )
+        # A câmera roda numa thread própria, com uma conexão própria ao
+        # simulador. Medido: dentro do laço do ROS, cada ciclo de câmera
+        # bloqueava ~150 ms, e a pose e os motores, que deveriam rodar a 20 Hz,
+        # caíam para 2,7 Hz — o robô girava ~40° entre um comando e outro.
+        # O socket da Remote API não pode ser dividido entre threads, por isso
+        # a segunda conexão.
+        self.camera_stop = threading.Event()
+        self.camera_thread = None
         if self.publish_images:
-            self.create_timer(
-                1.0 / self.get_parameter('image_rate').value, self.publish_camera
-            )
+            self.cam_client = RemoteAPIClient(
+                self.get_parameter('host').value, self.get_parameter('port').value)
+            self.sim_cam = self.cam_client.require('sim')
+            self.camera_thread = threading.Thread(target=self.camera_loop, daemon=True)
+            self.camera_thread.start()
         self.get_logger().info(
             f'ponte pronta. comandos em {self.resolve_topic_name("cmd_vel")}'
         )
@@ -335,6 +352,15 @@ class CoppeliaBridge(Node):
         depth = f"{robot}/{self.get_parameter('depth_sensor').value}"
         self.rgbHandle = self.find(rgb)
         self.depthHandle = self.find(depth)
+        self.on_demand = self.get_parameter('render_on_demand').value
+        self.original_handling = None
+        if self.on_demand:
+            self.original_handling = (
+                self.sim.getExplicitHandling(self.rgbHandle),
+                self.sim.getExplicitHandling(self.depthHandle),
+            )
+            self.sim.setExplicitHandling(self.rgbHandle, 1)
+            self.sim.setExplicitHandling(self.depthHandle, 1)
 
         width, height = self.sim.getVisionSensorRes(self.rgbHandle)
         # No CoppeliaSim o ângulo de perspectiva é o da maior dimensão da imagem.
@@ -372,6 +398,19 @@ class CoppeliaBridge(Node):
             f'{self.near:.2f} a {self.far:.2f} m'
         )
 
+    def camera_loop(self):
+        """Publica as imagens no ritmo image_rate, fora do laço do controle."""
+        periodo = 1.0 / self.get_parameter('image_rate').value
+        while not self.camera_stop.is_set():
+            inicio = time.monotonic()
+            try:
+                self.publish_camera()
+            except Exception as erro:   # simulação parando, conexão fechando
+                if not self.camera_stop.is_set():
+                    self.get_logger().warn(
+                        f'câmera: {erro}', throttle_duration_sec=5.0)
+            self.camera_stop.wait(max(0.0, periodo - (time.monotonic() - inicio)))
+
     def publish_camera(self):
         """Publica imagem colorida, profundidade e a TF do mesmo instante.
 
@@ -380,15 +419,23 @@ class CoppeliaBridge(Node):
         a detecção para o lado: a 0,5 rad/s, 100 ms de diferença já giram o
         referencial 3°, o que a 2 m vira 10 cm de erro — e o mapa se enche de
         cópias do mesmo objeto.
+
+        Só três chamadas ao simulador: pose, imagem e profundidade. Virar a
+        imagem e decodificar a profundidade é feito aqui, com numpy; pedir isso
+        ao simulador (transformImage, unpackFloatTable) custava ~75 ms cada.
         """
+        sim = self.sim_cam
         stamp = self.get_clock().now().to_msg()
         if self.get_parameter('publish_tf').value:
-            x, y, _, quat = self.read_pose()
-            self.publish_transforms(x, y, quat, stamp)
+            m = sim.getObjectMatrix(self.robotHandle, sim.handle_world)
+            self.publish_transforms(m[3], m[7], matrix_to_quaternion(m), stamp)
 
-        data, (width, height) = self.sim.getVisionSensorImg(self.rgbHandle)
-        # flag 4: desvira a imagem, que o CoppeliaSim entrega de baixo para cima.
-        data = self.sim.transformImage(data, [width, height], 4)
+        if self.on_demand:
+            sim.handleVisionSensor(self.rgbHandle)
+            sim.handleVisionSensor(self.depthHandle)
+        data, (width, height) = sim.getVisionSensorImg(self.rgbHandle)
+        # O CoppeliaSim entrega a imagem de baixo para cima: vira as linhas.
+        imagem = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 3)[::-1]
         rgb = Image()
         rgb.header.stamp = stamp
         rgb.header.frame_id = self.camera_frame
@@ -396,21 +443,13 @@ class CoppeliaBridge(Node):
         rgb.encoding = 'rgb8'
         rgb.is_bigendian = 0
         rgb.step = width * 3
-        rgb.data = data
+        rgb.data = np.ascontiguousarray(imagem).tobytes()
         self.rgb_pub.publish(rgb)
 
-        # O buffer vem normalizado de 0 (near) a 1 (far); aqui vira metro.
-        buf = self.sim.getVisionSensorDepthBuffer(
-            self.depthHandle + self.sim.handleflag_codedstring)
-        valores = self.sim.unpackFloatTable(buf)
-        metros = array.array(
-            'f', [self.near + v * (self.far - self.near) for v in valores])
-        # Mesma inversão vertical da imagem colorida, linha por linha.
-        linhas = [metros[i * width:(i + 1) * width] for i in range(height)]
-        invertido = array.array('f')
-        for linha in reversed(linhas):
-            invertido.extend(linha)
-
+        # Floats de 0 (near) a 1 (far), também de baixo para cima; vira metro.
+        buf = sim.getVisionSensorDepthBuffer(self.depthHandle + sim.handleflag_codedstring)
+        normal = np.frombuffer(buf, dtype=np.float32).reshape(height, width)[::-1]
+        metros = (self.near + normal * (self.far - self.near)).astype(np.float32)
         depth = Image()
         depth.header.stamp = stamp
         depth.header.frame_id = self.camera_frame
@@ -418,7 +457,7 @@ class CoppeliaBridge(Node):
         depth.encoding = '32FC1'
         depth.is_bigendian = 0
         depth.step = width * 4
-        depth.data = invertido.tobytes()
+        depth.data = np.ascontiguousarray(metros).tobytes()
         self.depth_pub.publish(depth)
 
         self.camera_info.header.stamp = stamp
@@ -537,7 +576,14 @@ class CoppeliaBridge(Node):
         if time.monotonic() >= self.deadline:
             self.velocity = (0.0, 0.0)
         left, right = self.velocity
-        self.write_motors(left, right)
+        # A velocidade alvo fica guardada na junta: reescrever o mesmo valor só
+        # gasta chamadas, e cada chamada disputa o simulador com a pose e a
+        # câmera. Escreve quando muda, e uma vez por segundo por garantia.
+        agora = time.monotonic()
+        if (left, right) != self.last_written or agora - self.last_write_time > 1.0:
+            self.write_motors(left, right)
+            self.last_written = (left, right)
+            self.last_write_time = agora
 
     def write_motors(self, left, right):
         """Escreve nas juntas (esquerda, direita), em m/s na roda."""
@@ -549,7 +595,13 @@ class CoppeliaBridge(Node):
         )
 
     def stop(self):
-        """Para os motores e, se foi a ponte que deu o play, para a simulação."""
+        """Para a câmera, os motores e, se foi a ponte que deu o play, a simulação."""
+        if self.camera_thread is not None:
+            self.camera_stop.set()
+            self.camera_thread.join(timeout=2.0)
+        if getattr(self, 'original_handling', None) is not None:
+            self.sim.setExplicitHandling(self.rgbHandle, self.original_handling[0])
+            self.sim.setExplicitHandling(self.depthHandle, self.original_handling[1])
         self.write_motors(0.0, 0.0)
         if self.started_here:
             self.sim.stopSimulation()

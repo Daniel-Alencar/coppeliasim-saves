@@ -1,74 +1,69 @@
 # potential_field
 
-Navegação por **campos potenciais** em ROS 2: o robô anda até as bananas
-desviando dos poops, na cena `pega_banana_potential_field.ttt`
-(`projects/7 - obstacle_avoidance/`). É o exercício daquela pasta, implementado
-como pacote ROS 2 em vez de child script.
+Navegação por **campos potenciais** com mapa construído pela **câmera**: o robô
+detecta bananas e poops com o YOLO na imagem da Kinect, estima a posição 3D de
+cada um pela profundidade, mantém um mapa persistente e anda até as bananas
+desviando dos poops. É o trabalho descrito em [requirements.md](requirements.md).
 
-A trajetória **não** é um caminho traçado nem uma lista de pontos: ela aparece
-sozinha da soma das forças.
+```
+Kinect RGB-D → YOLO → posição 3D → mapa persistente → campo potencial → rodas
+```
+
+As posições de bananas e poops **não** vêm dos sinais da cena nem de
+coordenadas fixas: o mapa começa vazio e cresce com o que a câmera vê. A
+trajetória também não é traçada: ela sai da soma das forças.
 
 ```
 F = F_atrativa(banana alvo) + Σ F_repulsiva(poop)
 ```
 
-O pacote separa o algoritmo da simulação em dois nós:
-
 ```
-                    bananas, poops, pose                cmd_vel
-CoppeliaSim ──ZeroMQ:23000──▶ coppelia_bridge ──────▶ navigator ──┐
-     ▲                              ▲                             │
-     └──────── motores ─────────────┴──────── cmd_vel ────────────┘
+              rgb, depth, pose, /tf                 detections/*
+CoppeliaSim ──ZeroMQ──▶ coppelia_bridge ──────▶ yolo_vision ──────▶ perception_map
+     ▲                       ▲                                           │ bananas, poops
+     │ motores               │ cmd_vel                                   ▼
+     └───────────────────────┴─────────────────────────────────────── navigator
 ```
 
 | Executável | Papel |
 |---|---|
-| `coppelia_bridge` | Só comunicação: lê a pose do robô e os sinais `banana`/`poop` da cena, publica no ROS e aplica o `cmd_vel` nos motores |
-| `navigator` | Só algoritmo: recebe mapa e pose por tópicos, calcula o campo potencial e publica `cmd_vel`. Não conhece o CoppeliaSim |
-| `fake_world` | Substitui a ponte para testar o navegador sem abrir o simulador |
-
-Essa divisão é o que torna o algoritmo testável: o `navigator` roda igual
-contra o simulador ou contra o `fake_world`.
+| `coppelia_bridge` | Só comunicação: publica imagem, profundidade, pose e TF da cena; aplica o `cmd_vel` nas rodas |
+| `yolo_vision` | Roda o YOLO, decide banana ou poop e projeta cada detecção em 3D no referencial da câmera |
+| `perception_map` | Leva as detecções para o mundo, funde as repetidas e mantém as listas de bananas e poops |
+| `navigator` | Campo potencial: escolhe o alvo, soma as forças, publica `cmd_vel`; procura quando não conhece banana |
+| `fake_world` | Substitui a ponte para testar o navegador sem o simulador |
 
 ---
 
 ## 1. Pré-requisitos
 
-- ROS 2 Jazzy (`/opt/ros/jazzy`)
-- CoppeliaSim aberto com `projects/7 - obstacle_avoidance/pega_banana_potential_field.ttt`
-- Cliente da Remote API no Python do sistema (o `ros2 run` não usa o `.venv/`):
+- ROS 2 Jazzy (`/opt/ros/jazzy`), com `cv_bridge`, `tf2_ros` e `message_filters`
+- CoppeliaSim aberto com a cena
+  [coppeliasim/robot/pega_banana_potential_field.ttt](coppeliasim/robot/pega_banana_potential_field.ttt),
+  **com interface gráfica**: a Kinect precisa de OpenGL para renderizar
+- No Python do sistema (o `ros2 run` não usa o `.venv/`):
 
 ```bash
-pip install --user coppeliasim-zmqremoteapi-client
-python3 -c "import coppeliasim_zmqremoteapi_client; print('ok')"
+/usr/bin/python3 -m pip install --user --break-system-packages \
+  coppeliasim-zmqremoteapi-client ultralytics "numpy<2"
 ```
 
-### A cena precisa ter
+O `"numpy<2"` evita que o `ultralytics` atualize o NumPy para a versão 2, que
+quebra o `cv_bridge` do ROS Jazzy. O modelo `yolo11s.pt` é baixado pelo
+`ultralytics` na primeira execução, na pasta de onde o launch foi chamado.
 
-```
-/myRobot
-├── leftMotor          (revolute joint, modo de velocidade)
-├── rightMotor         (revolute joint, modo de velocidade)
-└── python_controler   (script: DESABILITE)
-/buildScene            (script: cria os sinais banana e poop no play)
-```
+### Os scripts da cena
 
-**Desabilite o `/myRobot/python_controler`.** Ele escreve nos motores a cada
-passo de simulação e anula o `cmd_vel`. A ponte avisa no terminal quando acha
-um script da cena nessa situação.
+Exportados em [coppeliasim/scripts/](coppeliasim/scripts) — idênticos aos que
+estão na cena. Nenhum deles atrapalha o controle:
 
-### Os sinais do mapa
-
-O enunciado entrega as posições em dois sinais de string, com tabelas Lua
-empacotadas no formato `[x1, y1, x2, y2, ...]`:
-
-| Sinal | Conteúdo |
-|---|---|
-| `banana` | posições das bananas |
-| `poop` | posições dos poops |
-
-Eles **só existem depois do play**: quem os cria é o `/buildScene`. Enquanto
-não existirem, a ponte avisa uma vez e continua tentando.
+| Script | Faz | Interfere? |
+|---|---|---|
+| `/buildScene` | Sorteia e cria 20 bananas e 20 poops no *play*; publica os sinais `banana`/`poop` | Não. O modo câmera não lê os sinais |
+| `/dirt_script` | Quando o sensor `poopximity` (sob o robô) toca um objeto, o manda para z = 1000 e conta pontos | Não. É o placar: banana recolhida soma ponto, poop atropelado é penalidade |
+| `/myRobot/battery` | Publica o nível de bateria num sinal; o desgaste está em 0 | Não |
+| `/myRobot/odometry` e `encoder` | Calculam odometria e gravam numa propriedade do robô | Não; só leem as juntas |
+| `/myRobot/controler`, `/myRobot/python_controler` | **Escrevem nos motores** a cada passo | Estão **desabilitados** na cena. Se forem habilitados, anulam o `cmd_vel`; a ponte avisa no terminal |
 
 ---
 
@@ -77,7 +72,8 @@ não existirem, a ponte avisa uma vez e continua tentando.
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select potential_field --symlink-install
-source install/setup.bash    # no zsh: source install/setup.zsh
+source install/setup.bash
+source install/setup.zsh
 ros2 pkg executables potential_field
 ```
 
@@ -88,49 +84,48 @@ ros2 pkg executables potential_field
 Com o CoppeliaSim aberto e a cena carregada. A ponte dá o *play* sozinha se a
 simulação estiver parada, e a para ao sair se foi ela quem iniciou.
 
-```bash
-ros2 launch potential_field potential_field.launch.py
-```
-
-O robô sai atrás da banana pendente mais próxima e para quando todas tiverem
-sido alcançadas:
-
-```
-[navigator]: 12 bananas no mapa
-[navigator]: 8 poops no mapa
-[navigator]: banana 1/12 alcançada
-...
-[navigator]: todas as 12 bananas coletadas, parando
-```
-
-### Sem o simulador
-
-Para ver o algoritmo funcionando sem abrir o CoppeliaSim:
+**Terminal 1 — tudo:**
 
 ```bash
-ros2 launch potential_field potential_field.launch.py fake:=1
+ros2 launch potential_field perception_field.launch.py
 ```
 
-O `fake_world` integra a cinemática do robô e publica os mesmos tópicos da
-ponte. O mapa padrão dele tem três bananas e uma parede de poops entre o robô e
-a primeira — o caso em que o campo empata e a tangente precisa agir.
-
-### Só a ponte, dirigindo pelo teclado
+**Terminal 2 — o que o YOLO está vendo:**
 
 ```bash
-ros2 launch potential_field potential_field.launch.py navigator:=0
-ros2 run teleop_twist_keyboard teleop_twist_keyboard \
-  --ros-args -r cmd_vel:=/myRobot/cmd_vel
+ros2 run rqt_image_view rqt_image_view /myRobot/yolo/annotated
+```
+
+A caixa amarela é banana, a marrom é poop, e o texto mostra a classe que o
+YOLO deu e a confiança. No terminal 1 aparecem o mapa crescendo e as coletas:
+
+```
+[navigator]: nenhuma banana conhecida: procurando
+[perception_map]: mapa: 4 bananas e 5 poops (0 bananas já recolhidas)
+[navigator]: banana 1/4 alcançada
+[perception_map]: banana recolhida em (0.59, 0.01); 1 no total
 ```
 
 ### Argumentos do launch
 
 | Argumento | Padrão | O que faz |
 |---|---|---|
-| `robot` | `/myRobot` | Caminho do robô na cena |
-| `port` | `23000` | Porta da ZeroMQ Remote API |
-| `navigator` | `1` | `0` sobe só a ponte (para teleop ou outro controlador) |
-| `fake` | `0` | `1` troca a ponte pelo `fake_world` |
+| `model` | `yolo11s.pt` | Modelo do ultralytics (nome ou caminho do `.pt`) |
+| `navigator` | `1` | `0` só percebe e mapeia, sem mover o robô |
+| `unknown_as_poop` | `true` | Detecção sem classe nem cor reconhecível vira obstáculo |
+| `wheel_radius` | `0.05` | Raio da roda (m) |
+| `wheel_separation` | `0.0` | Distância entre rodas (m); `0.0` mede na cena (0,2 m) |
+| `robot` / `port` | `/myRobot` / `23000` | Robô e porta da Remote API |
+
+### Outros modos
+
+```bash
+# Gabarito: mapa lido dos sinais da cena (o exercício anterior)
+ros2 launch potential_field potential_field.launch.py
+
+# Sem o simulador: mundo de mentira para testar o navegador
+ros2 launch potential_field potential_field.launch.py fake:=1
+```
 
 ---
 
@@ -140,146 +135,179 @@ Todos no namespace `myRobot`, aplicado pelo launch.
 
 | Tópico | Tipo | Quem publica | Conteúdo |
 |---|---|---|---|
-| `/myRobot/pose` | `geometry_msgs/PoseStamped` | ponte | Pose do robô no mundo |
-| `/myRobot/bananas` | `geometry_msgs/PoseArray` | ponte | Mapa do sinal `banana` |
-| `/myRobot/poops` | `geometry_msgs/PoseArray` | ponte | Mapa do sinal `poop` |
-| `/myRobot/cmd_vel` | `geometry_msgs/Twist` | navegador | `linear.x` (m/s), `angular.z` (rad/s) |
-| `/myRobot/target` | `geometry_msgs/PointStamped` | navegador | Banana perseguida agora |
-| `/myRobot/force` | `geometry_msgs/Vector3Stamped` | navegador | Resultante do campo |
-| `/myRobot/collected` | `std_msgs/Int32` | navegador | Quantas bananas já foram |
+| `rgb/image` | `sensor_msgs/Image` (`rgb8`) | ponte | Imagem da Kinect, 320×240, 5 Hz |
+| `depth/image` | `sensor_msgs/Image` (`32FC1`) | ponte | Profundidade em metros, alinhada com a colorida |
+| `rgb/camera_info` | `sensor_msgs/CameraInfo` | ponte | Intrínsecos tirados do ângulo de visão da cena |
+| `/tf` | `tf2_msgs/TFMessage` | ponte | `world → base_link → camera_color_optical_frame` |
+| `pose` | `geometry_msgs/PoseStamped` | ponte | Pose do robô no mundo |
+| `detections/bananas`, `detections/poops` | `geometry_msgs/PoseArray` | `yolo_vision` | Detecções do quadro, no referencial da câmera |
+| `yolo/annotated` | `sensor_msgs/Image` | `yolo_vision` | Imagem com as caixas e a classe decidida |
+| `bananas`, `poops` | `geometry_msgs/PoseArray` | `perception_map` | Mapa persistente, no mundo (transient local) |
+| `cmd_vel` | `geometry_msgs/Twist` | navegador | `linear.x` (m/s), `angular.z` (rad/s) |
+| `target`, `force`, `collected` | `PointStamped`, `Vector3Stamped`, `Int32` | navegador | Alvo atual, resultante do campo, bananas coletadas |
 
-```bash
-ros2 topic echo /myRobot/target
-ros2 topic echo /myRobot/force
-ros2 run rqt_graph rqt_graph
+---
+
+## 5. Como funciona
+
+### Detecção e classe (`yolo_vision`)
+
+O **YOLO detecta** os objetos. A classe é decidida assim:
+
+1. Se o YOLO disser `banana` (46) ou `donut` (54), vale a classe dele.
+2. Senão, vale a **cor dentro da caixa**: amarelo é banana, marrom é poop.
+
+O segundo passo existe porque o YOLO treinado no COCO, nesta cena e a 320×240,
+também chama a banana de `frisbee`, `bird`, `sports ball`, `kite`… e o poop de
+`cow`, `cake`, `dining table`. Essas classes mudam de um modelo para outro, então
+listar todas seria frágil; a cor desempata sem depender do modelo.
+
+### Posição 3D
+
+Para cada caixa, a profundidade é o **percentil 20** dos pixels dela (a caixa
+também pega o piso atrás do objeto, que está mais longe). O centro da caixa é
+projetado pelo modelo *pinhole* do ROS:
+
+```
+X = (u − cx)·d/fx      Y = (v − cy)·d/fy      Z = d
 ```
 
-Os dois tópicos de mapa usam QoS **transient local**: a última mensagem fica
-guardada, então o navegador recebe o mapa mesmo subindo depois da ponte.
+Duas coisas tiveram de ser acertadas na ponte para isso valer:
 
-### Duas convenções que a ponte acerta
+- **O referencial do sensor do CoppeliaSim é o óptico do ROS girado 180° em
+  torno do eixo óptico** (o +x do sensor aponta para a esquerda da imagem). A
+  ponte publica a TF já com esse giro.
+- **A TF sai junto com a imagem, com o mesmo carimbo de tempo**, e o
+  `yolo_vision` só junta cor e profundidade de carimbos iguais. Com o robô
+  girando, combinar instantes diferentes jogava a detecção para o lado e
+  enchia o mapa de cópias do mesmo objeto.
 
-- **A frente do robô é o eixo +y dele** nesta cena, e não o +x como é usual no
-  ROS. A ponte converte, e o `yaw` publicado já é no sentido do ROS.
-- **Velocidade negativa na junta faz o robô andar para a frente** (mesma
-  convenção do `python_controler` da cena). É o parâmetro `motor_sign`, em
-  `-1.0`. Se o robô andar ao contrário, troque para `1.0`.
+### Mapa persistente (`perception_map`)
 
----
+- Cada detecção vai para o mundo pela TF do instante da imagem.
+- Detecções a menos de `merge_radius` de um objeto já conhecido são o mesmo
+  objeto: atualizam a média da posição em vez de criar outro.
+- Um objeto só entra no mapa depois de visto `min_hits` vezes.
+- Girando acima de `max_spin_to_create`, as detecções ainda refinam os
+  objetos conhecidos, mas não criam novos.
+- Quando o robô passa por cima de uma banana, ela sai do mapa e entra numa
+  lista de recolhidas, para não voltar se for vista de novo.
 
-## 5. O algoritmo
+### Campo potencial (`navigator`)
 
-Tudo em `potential_field/navigator.py`, um ciclo por mensagem de `pose`.
+1. **Alvo:** a banana pendente mais próxima. Só ela atrai.
+2. **Atração** para o alvo, saturada em `k_att`.
+3. **Repulsão** de cada poop a menos de `d0_poop`: `k_rep · (1/d − 1/d0) / d²`.
+4. **Resultante** saturada em `f_max`; a direção dela é o rumo desejado.
+5. **Comando:** o erro de rumo vira `angular.z`; o avanço é `v_max · cos(erro)`.
+   A ponte converte em velocidade de cada roda.
+6. **Coleta:** a menos de `collect_radius` do alvo, a banana conta como
+   alcançada e ele escolhe a próxima.
+7. **Busca:** sem banana conhecida, gira uma volta inteira devagar (a câmera vê
+   o entorno), anda um pouco desviando dos poops conhecidos e gira de novo. Só
+   para depois de `search_timeout` sem achar nada.
 
-1. **Alvo.** A banana pendente mais próxima. Só ela atrai; as outras são
-   ignoradas até virarem alvo.
-2. **Atração.** Aponta para o alvo, com módulo saturado em `k_att`: longe o
-   puxão é constante, perto ele diminui junto com a distância.
-3. **Repulsão.** Cada poop dentro de `d0_poop` empurra o robô, na forma
-   clássica `k_rep · (1/d − 1/d0) / d²`, apontando do poop para o robô.
-4. **Resultante.** Soma das duas, saturada em `f_max`. A direção dela é o rumo
-   desejado.
-5. **Comando.** O erro entre esse rumo e o do robô vira `angular.z`; o avanço é
-   `v_max · cos(erro)`, e com erro acima de `turn_in_place` o robô gira parado
-   em vez de andar torto.
-6. **Coleta.** Chegando a `collect_radius` do alvo, a banana sai da lista e ele
-   escolhe a próxima. Sem bananas pendentes, publica velocidade zero e para.
-
-### Mínimos locais
-
-Campo potencial tem um problema conhecido: a repulsão pode cancelar a atração e
-o robô trava sem chegar na banana — típico com vários poops enfileirados entre
-ele e o alvo.
-
-O navegador detecta isso pelo **progresso**: se em `stall_time` segundos a
-distância até o alvo não cai pelo menos `stall_progress`, ele liga por
-`swirl_time` segundos uma componente **tangencial**, perpendicular à repulsão,
-ou seja, acompanhando a borda do obstáculo. O lado é escolhido pela geometria:
-aquele cuja tangente aponta mais para o alvo.
-
-Continua sendo força, e não caminho traçado: a tangente entra na soma junto com
-a atração e a repulsão.
-
-> O lado precisa vir da geometria. Uma versão anterior simplesmente invertia o
-> lado a cada ativação, e no teste com parede de poops o robô oscilava na frente
-> dela indefinidamente, sem nunca contornar.
+Mínimos locais (repulsão anulando a atração) são resolvidos com uma componente
+tangencial à repulsão, ligada quando a distância ao alvo para de cair.
 
 ---
 
-## 6. Parâmetros
+## 6. Resultados medidos
+
+Avaliação feita contra as posições verdadeiras da cena, lidas **só pelo
+roteiro de teste**, nunca pelos nós.
+
+**Modelos**, em 14 quadros de uma volta completa do robô:
+
+| Modelo | Bananas distintas | Poops distintos | Falsos positivos | Tempo/quadro (CPU) |
+|---|---|---|---|---|
+| `yolov8n` | 15 | 6 | 0 | ~0,1 s |
+| `yolo11n-seg` | 15 | 9 | 0 | ~0,1 s |
+| **`yolo11s`** | **16** | **10** | **0** | ~0,2 s |
+| `yolo11m` | 16 | 6 | 1 | ~0,3 s |
+
+**Classe** (regra classe nominal + cor), com o `yolo11s` em dois mapas
+sorteados: **140 de 140 detecções corretas**.
+
+**Posição:** erro mediano de 3 cm nas bananas e 9 cm nos poops, num quadro
+parado.
+
+**Execução completa**, 4 minutos:
+
+| Bananas recolhidas | Poops atropelados | Mapa de bananas | Mapa de poops |
+|---|---|---|---|
+| 8 de 20 | 0 | erro 10 cm, 1 duplicata | 16 poops, erro 8 cm, 1 duplicata |
+
+---
+
+## 7. Parâmetros
+
+### `yolo_vision`
+
+| Parâmetro | Padrão | Descrição |
+|---|---|---|
+| `model` | `yolo11s.pt` | Modelo do ultralytics |
+| `confidence` | `0.10` | Confiança mínima (objetos pequenos pedem valor baixo) |
+| `imgsz` | `640` | Tamanho de entrada do YOLO |
+| `banana_classes` / `poop_classes` | `[46]` / `[54]` | Classes do COCO que decidem direto |
+| `classify_by_color` | `true` | Demais classes decididas pela cor da caixa |
+| `banana_hsv_low/high` | `[20,120,100]` / `[40,255,255]` | Amarelo da banana (HSV do OpenCV) |
+| `poop_hsv_low/high` | `[5,60,40]` / `[18,200,100]` | Marrom do poop |
+| `unknown_as_poop` | `true` | Sem classe nem cor: obstáculo |
+| `depth_percentile` | `20` | Percentil da profundidade dentro da caixa |
+| `max_range` | `2.5` | Ignora detecções mais longe (m) |
+| `color_proposals` | `false` | Também detectar por mancha de cor, sem YOLO |
+
+### `perception_map`
+
+| Parâmetro | Padrão | Descrição |
+|---|---|---|
+| `merge_radius` | `0.35` | Distância para considerar a mesma detecção (m) |
+| `min_hits` | `2` | Vezes visto antes de entrar no mapa |
+| `collect_radius` | `0.12` | Robô a menos disto: banana recolhida (m) |
+| `collected_radius` | `0.30` | Raio em que uma recolhida bloqueia recriação (m) |
+| `max_spin_to_create` | `0.5` | Giro máximo para criar objeto novo (rad/s) |
 
 ### `navigator`
 
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
-| `k_att` | `1.0` | Ganho da atração |
-| `att_range` | `1.0` | Acima desta distância a atração satura (m) |
-| `k_rep` | `0.08` | Ganho da repulsão |
-| `d0_poop` | `0.55` | Raio de influência de cada poop (m) |
-| `d_min` | `0.08` | Distância mínima usada na conta (m) |
+| `k_att` / `att_range` | `1.0` / `1.0` | Ganho e saturação da atração |
+| `k_rep` / `d0_poop` / `d_min` | `0.08` / `0.55` / `0.08` | Repulsão |
 | `f_max` | `3.0` | Saturação da resultante |
-| `v_max` | `0.25` | Velocidade de avanço (m/s) |
-| `w_max` | `1.8` | Velocidade de giro (rad/s) |
-| `k_heading` | `3.0` | rad/s por rad de erro de rumo |
-| `turn_in_place` | `1.31` (75°) | Acima disso gira parado (rad) |
+| `v_max` / `w_max` / `k_heading` | `0.25` / `1.8` / `3.0` | Velocidades e ganho de rumo |
+| `turn_in_place` | 75° | Acima disso gira parado |
 | `collect_radius` | `0.10` | Distância que conta como banana alcançada (m) |
-| `stall_time` | `2.0` | Segundos sem progresso que caracterizam empate |
-| `stall_progress` | `0.05` | Aproximação mínima nesse tempo (m) |
-| `swirl_time` | `2.5` | Duração da componente tangencial (s) |
-| `swirl_gain` | `1.2` | Peso dela em relação à atração |
-
-Os ganhos são lidos a cada ciclo, então dá para ajustar com a simulação rodando:
-
-```bash
-ros2 param set /myRobot/navigator k_rep 0.15
-ros2 param set /myRobot/navigator d0_poop 0.7
-ros2 param list /myRobot/navigator
-```
+| `search_w` / `search_v` | `0.4` / `0.18` | Giro e avanço da busca |
+| `search_spin_time` / `search_move_time` | `16` / `3` | Duração das fases da busca (s) |
+| `search_timeout` | `120` | Desiste de procurar depois disso (s) |
+| `pose_timeout` | `1.0` | Sem pose nova por este tempo: para o robô (s) |
+| `stall_time` / `swirl_time` / `swirl_gain` | `2.0` / `2.5` / `1.2` | Mínimos locais |
 
 ### `coppelia_bridge`
 
 | Parâmetro | Padrão | Descrição |
 |---|---|---|
-| `host` / `port` | `localhost` / `23000` | Onde está o CoppeliaSim |
-| `robot` | `/myRobot` | Caminho do robô na cena |
-| `banana_signal` / `poop_signal` | `banana` / `poop` | Nomes dos sinais do mapa |
-| `wheel_radius` | `0.05` | Raio da roda (m) |
-| `wheel_separation` | `0.0` | Distância entre rodas (m); `0.0` = medir na cena |
-| `motor_sign` | `-1.0` | Sinal aplicado às juntas |
-| `max_wheel_speed` | `10.0` | Limite por roda (rad/s) |
-| `cmd_timeout` | `0.5` | Segundos sem `cmd_vel` até parar |
-| `rate` | `20.0` | Frequência da pose (Hz) — é o ritmo do controle |
-| `motor_rate` | `20.0` | Frequência de escrita nos motores (Hz) |
-| `map_rate` | `0.5` | Frequência de releitura dos sinais do mapa (Hz) |
-| `autostart` | `true` | Dar *play* se a simulação estiver parada |
-
-Com a simulação rodando, cada chamada da Remote API só é atendida entre passos
-e custa alguns milissegundos. Subir `rate` além de ~20 Hz não deixa o controle
-mais rápido: só enfileira chamadas.
+| `map_source` | `signals` | `perception` no launch da câmera: não publica o mapa dos sinais |
+| `image_rate` | `5.0` | Imagens e TF por segundo (Hz) |
+| `wheel_radius` / `wheel_separation` | `0.05` / `0.0` | Geometria; `0.0` mede a separação na cena |
+| `motor_sign` | `-1.0` | Nesta cena, velocidade negativa leva o robô para a frente |
+| `cmd_timeout` | `0.5` | Sem `cmd_vel` por este tempo: para |
 
 ---
 
-## 7. Problemas comuns
+## 8. Problemas comuns
 
 | Sintoma | O que fazer |
 |---|---|
-| `Não consegui falar com o CoppeliaSim em localhost:23000` | Abra o simulador; se já estiver aberto, algum script da cena está travando a thread principal |
-| `sinais "banana" e "poop" ainda não existem` | Dê *play* na cena: quem os cria é o `/buildScene` |
-| `Objeto "/myRobot/leftMotor" não existe na cena` | A ponte lista os objetos no terminal; ajuste `robot:=` |
-| `estes scripts da cena escrevem nos motores` | Desabilite o `/myRobot/python_controler` |
+| `ModuleNotFoundError: ultralytics` ou erro no `cv_bridge` | Instale como na seção 1, com `"numpy<2"` |
+| `Não consegui falar com o CoppeliaSim` | Abra o simulador; se já estiver aberto, algum script da cena trava a thread principal |
+| O CoppeliaSim fecha sozinho (*signal 11*) | Está em modo headless; a Kinect precisa de interface gráfica |
+| `yolo/annotated` não aparece | O `yolo_vision` só processa quando chegam cor, profundidade e `camera_info`; confira a ponte |
+| `sem TF de camera_color_optical_frame para world` | A ponte não está publicando imagens; no launch da câmera isso é automático |
+| O mapa enche de cópias do mesmo objeto | Aumente `merge_radius`, ou reduza `max_spin_to_create` |
+| Bananas viram poop no mapa (ou o contrário) | Ajuste as faixas HSV; confira as caixas em `yolo/annotated` |
+| O robô atravessa poops | Os poops ainda não estavam no mapa: aumente `k_rep`/`d0_poop` ou reduza `v_max` |
+| `estes scripts da cena escrevem nos motores` | Desabilite `/myRobot/python_controler` e `/myRobot/controler` |
 | O robô anda para trás | Troque `motor_sign` para `1.0` |
-| O robô gira em torno de si mesmo sem sair | Rumo invertido: confira o eixo da frente do robô na cena (aqui é o +y) |
-| O robô para no meio do caminho | `cmd_timeout` expirou porque o navegador caiu; veja o terminal dele |
-| O robô encosta nos poops | Aumente `k_rep` ou `d0_poop` |
-| O robô dá voltas largas demais | Diminua `d0_poop`, ou aumente `k_att` |
-| Trava antes da banana e fica indo e voltando | É mínimo local: diminua `stall_time` ou aumente `swirl_gain` |
-| `Package 'potential_field' not found` | Faltou sourcear o workspace; no zsh tem que ser `install/setup.zsh` |
-
----
-
-## 8. Relação com o script da pasta `projects/`
-
-`projects/7 - obstacle_avoidance/scripts/PotentialFields.py` faz o mesmo
-algoritmo em um arquivo só, para colar como child script na cena. Este pacote é
-a versão ROS 2: mesma física, separada em nós, com os ganhos como parâmetros e
-com o mapa, o alvo e a força visíveis como tópicos.
+| `Package 'potential_field' not found` | Faltou sourcear o workspace; no zsh, `install/setup.zsh` |

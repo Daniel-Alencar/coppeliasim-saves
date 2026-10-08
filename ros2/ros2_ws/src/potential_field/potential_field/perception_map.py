@@ -35,20 +35,38 @@ import tf2_ros
 
 
 class Landmark:
-    """Um objeto do mapa: posição média e quantas vezes já foi visto."""
+    """Um objeto do mapa: posição média, vezes visto e votos de classe.
 
-    def __init__(self, x, y, stamp):
+    A classe não é fixada na primeira detecção: cada vez que o objeto é visto
+    ele recebe um voto (banana ou poop), e vale a maioria. Assim uma
+    classificação errada isolada não vira um objeto à parte com a classe
+    trocada — medido, era isso que fazia o robô mirar num poop achando que era
+    banana e passar por cima dele.
+    """
+
+    def __init__(self, x, y, classe, stamp):
         self.x = x
         self.y = y
-        self.hits = 1
+        self.hits = 0
+        self.votes = {'banana': 0, 'poop': 0}
         self.last_seen = stamp
+        self.vote(classe)
 
-    def update(self, x, y, stamp, weight_cap):
+    def vote(self, classe):
+        self.votes[classe] += 1
+        self.hits += 1
+
+    @property
+    def classe(self):
+        # Empate fica com poop: na dúvida, desviar é o lado seguro.
+        return 'banana' if self.votes['banana'] > self.votes['poop'] else 'poop'
+
+    def update(self, x, y, classe, stamp, weight_cap):
         """Média corrida das observações, com peso que para de crescer."""
         n = min(self.hits, weight_cap)
         self.x = (self.x * n + x) / (n + 1)
         self.y = (self.y * n + y) / (n + 1)
-        self.hits += 1
+        self.vote(classe)
         self.last_seen = stamp
 
 
@@ -78,8 +96,7 @@ class PerceptionMap(Node):
         self.declare_parameter('max_spin_to_create', 0.5)   # [rad/s]
 
         self.world_frame = self.get_parameter('world_frame').value
-        self.bananas = []       # [Landmark]
-        self.poops = []         # [Landmark]
+        self.marks = []         # [Landmark], bananas e poops juntos
         self.collected = []     # [(x, y)] bananas que já foram recolhidas
         self.robot = None       # (x, y) da última pose
         self.spin = 0.0         # velocidade de giro estimada [rad/s]
@@ -91,10 +108,10 @@ class PerceptionMap(Node):
 
         self.create_subscription(
             PoseArray, 'detections/bananas',
-            lambda msg: self.detections_callback(msg, self.bananas), 10)
+            lambda msg: self.detections_callback(msg, 'banana'), 10)
         self.create_subscription(
             PoseArray, 'detections/poops',
-            lambda msg: self.detections_callback(msg, self.poops), 10)
+            lambda msg: self.detections_callback(msg, 'poop'), 10)
         self.create_subscription(PoseStamped, 'pose', self.pose_callback, 10)
 
         # Mesmo QoS da ponte: quem subir depois recebe o último mapa.
@@ -124,8 +141,9 @@ class PerceptionMap(Node):
         self.ultima_pose = (self.robot[0], self.robot[1], rumo, agora)
         radius = self.get_parameter('collect_radius').value
         restantes = []
-        for mark in self.bananas:
-            if math.hypot(mark.x - self.robot[0], mark.y - self.robot[1]) <= radius:
+        for mark in self.marks:
+            if (mark.classe == 'banana' and
+                    math.hypot(mark.x - self.robot[0], mark.y - self.robot[1]) <= radius):
                 self.collected.append((mark.x, mark.y))
                 self.get_logger().info(
                     f'banana recolhida em ({mark.x:.2f}, {mark.y:.2f}); '
@@ -133,9 +151,9 @@ class PerceptionMap(Node):
                 )
             else:
                 restantes.append(mark)
-        self.bananas = restantes
+        self.marks = restantes
 
-    def detections_callback(self, msg: PoseArray, alvo):
+    def detections_callback(self, msg: PoseArray, classe):
         """Leva as detecções do quadro para o mundo e funde com o mapa."""
         if not msg.poses:
             return
@@ -161,7 +179,7 @@ class PerceptionMap(Node):
 
         for pose in msg.poses:
             x, y = self.to_world(tf, pose)
-            self.merge(alvo, x, y, msg.header.stamp)
+            self.merge(classe, x, y, msg.header.stamp)
 
     def to_world(self, tf, pose):
         """Aplica a transformada (rotação por quaternion + translação)."""
@@ -176,23 +194,23 @@ class PerceptionMap(Node):
             + 2 * (yy * zz - xx * ww) * pz
         return vx + t.x, vy + t.y
 
-    def merge(self, alvo, x, y, stamp):
-        """Junta a detecção ao objeto mais próximo, ou cria um novo."""
-        if alvo is self.bananas and self.is_collected(x, y):
+    def merge(self, classe, x, y, stamp):
+        """Junta a detecção ao objeto mais próximo, de qualquer classe, ou cria um novo."""
+        if classe == 'banana' and self.is_collected(x, y):
             return   # já recolhida: não ressuscita
 
         merge_radius = self.get_parameter('merge_radius').value
         perto, menor = None, merge_radius
-        for mark in alvo:
+        for mark in self.marks:
             d = math.hypot(mark.x - x, mark.y - y)
             if d <= menor:
                 perto, menor = mark, d
         if perto is None:
             if self.spin > self.get_parameter('max_spin_to_create').value:
                 return   # girando rápido demais para confiar num ponto novo
-            alvo.append(Landmark(x, y, stamp))
+            self.marks.append(Landmark(x, y, classe, stamp))
         else:
-            perto.update(x, y, stamp, self.get_parameter('weight_cap').value)
+            perto.update(x, y, classe, stamp, self.get_parameter('weight_cap').value)
 
     def is_collected(self, x, y):
         radius = self.get_parameter('collected_radius').value
@@ -202,14 +220,14 @@ class PerceptionMap(Node):
     #  Saída
     # =========================================================================
 
-    def confirmed(self, marks):
-        """Só os objetos vistos vezes suficientes entram no mapa publicado."""
+    def confirmed(self, classe):
+        """Objetos da classe vistos vezes suficientes para entrar no mapa."""
         min_hits = self.get_parameter('min_hits').value
-        return [m for m in marks if m.hits >= min_hits]
+        return [m for m in self.marks if m.hits >= min_hits and m.classe == classe]
 
     def publish_map(self):
-        bananas = self.confirmed(self.bananas)
-        poops = self.confirmed(self.poops)
+        bananas = self.confirmed('banana')
+        poops = self.confirmed('poop')
         self.banana_pub.publish(self.to_pose_array(bananas))
         self.poop_pub.publish(self.to_pose_array(poops))
 
@@ -242,7 +260,12 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
+        # O ros2 launch repassa um segundo Ctrl+C durante a limpeza; sem isto
+        # ele interrompe o destroy_node e imprime um traceback inofensivo.
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         rclpy.try_shutdown()
     return 0
 
