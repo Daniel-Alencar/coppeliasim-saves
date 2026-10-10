@@ -40,8 +40,7 @@ O plugin só é carregado se o ambiente ROS estiver na shell que abre o
 simulador. Abrir pelo ícone do sistema **não** funciona:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /opt/ros/jazzy/setup.zsh
+source /opt/ros/jazzy/setup.zsh     # no zsh; .bash se a sua shell for bash
 ./coppeliaSim.sh
 ```
 
@@ -68,8 +67,7 @@ Os nomes estão fixos no script: se você rodar o nó **sem** o namespace
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select car_control --symlink-install
-source install/setup.bash
-source install/setup.zsh
+source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
 ```
 
 No zsh, sourcear `setup.bash` não funciona: o script não descobre a própria
@@ -97,8 +95,7 @@ ros2 launch car_control car_control.launch.py
 **Terminal 2 — o teclado:**
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /opt/ros/jazzy/setup.zsh
+source /opt/ros/jazzy/setup.zsh     # no zsh; .bash se a sua shell for bash
 ros2 run turtlesim turtle_teleop_key --ros-args -r __ns:=/car_control
 ```
 

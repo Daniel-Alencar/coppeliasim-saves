@@ -102,8 +102,7 @@ terminal, **a partir da pasta `scripts/`** e nesta ordem. Em todos os
 terminais:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /opt/ros/jazzy/setup.zsh
+source /opt/ros/jazzy/setup.zsh     # no zsh; .bash se a sua shell for bash
 cd "projects/5 - tf_demo/scripts"
 ```
 

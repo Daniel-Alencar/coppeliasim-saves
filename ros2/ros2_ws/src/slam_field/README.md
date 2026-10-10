@@ -4,8 +4,8 @@ Navegação por **campos potenciais** sobre o mapa do **SLAM Toolbox**: o robô
 vai até as bananas desviando dos obstáculos que o laser 2D colocou no `/map`, e
 o scan atual faz uma **parada de emergência** contra o que o mapa ainda não
 tem. É o exercício descrito em
-[coppeliasim/requirements.md](../../../../coppeliasim/requirements.md), com a
-cena [coppeliasim/p3_slam_toolbox.ttt](../../../../coppeliasim/p3_slam_toolbox.ttt).
+[coppeliasim/requirements.md](coppeliasim/requirements.md), com a
+cena [coppeliasim/robot/p3_slam_toolbox.ttt](coppeliasim/robot/p3_slam_toolbox.ttt).
 
 ```
 F = F_atrativa(banana alvo) + Σ_setores F_repulsiva(borda inflada mais próxima)
@@ -50,7 +50,7 @@ sudo apt install ros-jazzy-slam-toolbox ros-jazzy-teleop-twist-keyboard
 
 ### Os scripts da cena
 
-Exportados em [coppeliasim/scripts/](../../../../coppeliasim/scripts):
+Exportados em [coppeliasim/scripts/](coppeliasim/scripts):
 
 | Script | Faz | Interfere? |
 |---|---|---|
@@ -72,8 +72,7 @@ nem poops (os poops não são obstáculo neste exercício).
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select slam_field --symlink-install
-source install/setup.bash
-source install/setup.zsh
+source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
 ros2 pkg executables slam_field
 ```
 

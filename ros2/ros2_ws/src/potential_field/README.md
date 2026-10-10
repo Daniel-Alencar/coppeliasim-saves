@@ -72,8 +72,7 @@ estão na cena. Nenhum deles atrapalha o controle:
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select potential_field --symlink-install
-source install/setup.bash
-source install/setup.zsh
+source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
 ros2 pkg executables potential_field
 ```
 
@@ -321,6 +320,7 @@ parado.
 |---|---|
 | `ModuleNotFoundError: ultralytics` ou erro no `cv_bridge` | Instale como na seção 1, com `"numpy<2"` |
 | `Não consegui falar com o CoppeliaSim` | Abra o simulador; se já estiver aberto, algum script da cena trava a thread principal |
+| A ponte não imprime nada e a simulação não começa | O CoppeliaSim pode estar noutra porta: ele usa a 23001 se a 23000 estiver ocupada quando sobe. Confira com `ss -ltnp \| grep coppeliaSim` e passe `port:=23001` |
 | O CoppeliaSim fecha sozinho (*signal 11*) | Está em modo headless; a Kinect precisa de interface gráfica |
 | `yolo/annotated` não aparece | O `yolo_vision` só processa quando chegam cor, profundidade e `camera_info`; confira a ponte |
 | `sem TF de camera_color_optical_frame para world` | A ponte não está publicando imagens; no launch da câmera isso é automático |

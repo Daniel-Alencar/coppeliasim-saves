@@ -60,8 +60,7 @@ nos motores disputa o controle com a ponte e ela nem sempre ganha. O
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select diff_robot --symlink-install
-source install/setup.bash
-source install/setup.zsh
+source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
 ```
 
 No zsh, sourcear `setup.bash` não funciona: o script não descobre a própria
@@ -91,8 +90,7 @@ ros2 launch diff_robot diff_robot.launch.py
 **Terminal 2 — o teclado:**
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /opt/ros/jazzy/setup.zsh
+source /opt/ros/jazzy/setup.zsh     # no zsh; .bash se a sua shell for bash
 ros2 run teleop_twist_keyboard teleop_twist_keyboard \
   --ros-args -r cmd_vel:=/diff_robot/cmd_vel
 ```
@@ -209,6 +207,7 @@ ros2 param list /diff_robot/coppelia_bridge
 | Sintoma | O que fazer |
 |---|---|
 | `Não consegui falar com o CoppeliaSim na porta 23000` | Abra o simulador. Se já estiver aberto, algum child script da cena está travando a thread principal (típico de controlador Python com `curses` ou que abre um `RemoteAPIClient` para o próprio simulador) — pare a simulação e desabilite o script |
+| A ponte não imprime nada e a simulação não começa | O CoppeliaSim pode estar noutra porta: ele usa a 23001 se a 23000 estiver ocupada quando sobe. Confira com `ss -ltnp \| grep coppeliaSim` e passe `port:=23001` |
 | `Objeto "/myRobot/leftMotor" não existe na cena` | A ponte lista os objetos existentes no terminal; ajuste `robot:=` ou renomeie na cena |
 | `o script X está habilitado e sobrescreve os comandos` | Desabilite o child script do robô na cena |
 | `a simulação está pausada` | Dê *play* no CoppeliaSim; motores pausados ignoram comandos |

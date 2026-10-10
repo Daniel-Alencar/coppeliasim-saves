@@ -98,8 +98,7 @@ Parar e dar *play* de novo no CoppeliaSim reinicia a bateria em 100 %.
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select robot_docking --symlink-install
-source install/setup.bash
-source install/setup.zsh
+source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
 ```
 
 No zsh, sourcear `setup.bash` não funciona: o script não descobre a própria
@@ -140,8 +139,7 @@ rodas, e a que diz `ponte pronta`.
 **Terminal 2 — os comandos e as leituras:**
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-source /opt/ros/jazzy/setup.zsh
+source /opt/ros/jazzy/setup.zsh     # no zsh; .bash se a sua shell for bash
 
 ros2 topic echo /myRobot/battery --field percentage
 ros2 topic echo /myRobot/charging
@@ -284,6 +282,7 @@ ros2 param list /myRobot/remoteAPI_ROS2_bridge
 | Sintoma | O que fazer |
 |---|---|
 | `Não consegui falar com o CoppeliaSim em localhost:23000` | Abra o simulador. Se já estiver aberto, algum script da cena está travando a thread principal — pare a simulação e desabilite esse script |
+| A ponte não imprime nada e a simulação não começa | O CoppeliaSim pode estar noutra porta: ele usa a 23001 se a 23000 estiver ocupada quando sobe. Confira com `ss -ltnp \| grep coppeliaSim` e passe `port:=23001` |
 | `Objeto "/myRobot/leftMotor" não existe na cena` | A ponte lista os objetos existentes no terminal; ajuste `robot:=` ou renomeie na cena |
 | `motor_mode=joint, mas estes scripts da cena escrevem nos motores` | Desabilite o `/myRobot/python_controler` na cena, ou use `motor_mode:=signal` |
 | `motor_mode=signal, mas nenhum script habilitado do robô lê os sinais` | Habilite o `python_controler`, ou volte para `motor_mode:=joint` |
