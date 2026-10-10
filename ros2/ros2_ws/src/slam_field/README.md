@@ -4,7 +4,7 @@ Navegação por **campos potenciais** sobre o mapa do **SLAM Toolbox**: o robô
 vai até as bananas desviando dos obstáculos que o laser 2D colocou no `/map`, e
 o scan atual faz uma **parada de emergência** contra o que o mapa ainda não
 tem. É o exercício descrito em
-[coppeliasim/requirements.md](coppeliasim/requirements.md), com a
+[requirements.md](requirements.md), com a
 cena [coppeliasim/robot/p3_slam_toolbox.ttt](coppeliasim/robot/p3_slam_toolbox.ttt).
 
 ```
