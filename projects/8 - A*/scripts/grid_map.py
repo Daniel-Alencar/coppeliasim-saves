@@ -71,6 +71,22 @@ def arena_bounds(sim, points, margin=0.3):
     return box
 
 
+def world_to_cell(info, position):
+    """Posição do mundo -> (linha, coluna), ou None se cair fora do mapa."""
+    col = int(math.floor((position[0] - info['x_min']) / info['resolution']))
+    row = int(math.floor((position[1] - info['y_min']) / info['resolution']))
+    if 0 <= row < info['rows'] and 0 <= col < info['cols']:
+        return row, col
+    return None
+
+
+def cell_to_world(info, row, col):
+    """(linha, coluna) -> (x, y) do centro da célula."""
+    x = info['x_min'] + (col + 0.5) * info['resolution']
+    y = info['y_min'] + (row + 0.5) * info['resolution']
+    return x, y
+
+
 def build_grid(poops, bananas, robot, bounds, resolution, inflate=0.0):
     """Monta a matriz de ocupação. Devolve (grid, info)."""
     x_min, x_max, y_min, y_max = bounds
@@ -79,13 +95,17 @@ def build_grid(poops, bananas, robot, bounds, resolution, inflate=0.0):
 
     grid = [[FREE] * cols for _ in range(rows)]
 
+    info = {
+        'rows': rows, 'cols': cols, 'resolution': resolution,
+        'inflate': inflate,
+        'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max,
+        'legend': {str(v): k for k, v in
+                   zip(['free', 'poop', 'inflated', 'banana', 'robot'],
+                       [FREE, POOP, INFLATED, BANANA, ROBOT])},
+    }
+
     def to_cell(position):
-        """Converte posição do mundo em (linha, coluna), ou None se sair do mapa."""
-        col = int(math.floor((position[0] - x_min) / resolution))
-        row = int(math.floor((position[1] - y_min) / resolution))
-        if 0 <= row < rows and 0 <= col < cols:
-            return row, col
-        return None
+        return world_to_cell(info, position)
 
     # Obstáculos primeiro, depois a inflação, depois alvos e robô: assim um
     # poop nunca é apagado por uma margem e o robô fica sempre visível.
@@ -118,29 +138,28 @@ def build_grid(poops, bananas, robot, bounds, resolution, inflate=0.0):
         if cell:
             grid[cell[0]][cell[1]] = ROBOT
 
-    info = {
-        'rows': rows, 'cols': cols, 'resolution': resolution,
-        'inflate': inflate,
-        'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max,
-        'legend': {str(v): k for k, v in
-                   zip(['free', 'poop', 'inflated', 'banana', 'robot'],
-                       [FREE, POOP, INFLATED, BANANA, ROBOT])},
-    }
     return grid, info
 
 
-def print_grid(grid, info):
+def print_grid(grid, info, path=None):
+    """Imprime a matriz. Se `path` (lista de células) for dado, o caminho
+    aparece como '*', sem apagar o robô nem a banana alvo."""
     rows, cols = info['rows'], info['cols']
+    path_cells = set(path or [])
     width = len(str(rows - 1))
 
     print(f"\nMapa {rows}x{cols}  |  resolução {info['resolution']} m/célula  "
           f"|  inflação {info['inflate']} m")
     print(f"x ∈ [{info['x_min']:+.2f}, {info['x_max']:+.2f}]  "
           f"y ∈ [{info['y_min']:+.2f}, {info['y_max']:+.2f}]")
-    print('legenda: . livre   # poop   o margem   B banana   R robô\n')
+    legend = 'legenda: . livre   # poop   o margem   B banana   R robô'
+    print(legend + ('   * caminho\n' if path_cells else '\n'))
 
     for row in range(rows - 1, -1, -1):          # +y para cima
-        line = ' '.join(SYMBOLS[cell] for cell in grid[row])
+        line = ' '.join(
+            '*' if (row, col) in path_cells and grid[row][col] in (FREE, INFLATED)
+            else SYMBOLS[grid[row][col]]
+            for col in range(cols))
         print(f'{row:>{width}} | {line}')
 
     # régua das colunas (só a dezena, para não poluir)
