@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>youbot_banana</name>
+  <version>0.0.1</version>
+  <description>Manipulador móvel: o KUKA youBot planeja com A*, navega com a base holonômica, pega a banana com cinemática inversa do braço de 5 juntas e a deposita na bandeja.</description>
+  <maintainer email="danielalencar746@gmail.com">daniel.carvalho</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- O planejamento global (A* e mapa de ocupação) é REAPROVEITADO do
+       exercício anterior, e não reescrito: mission.py faz
+       `from a_star_banana import a_star`. -->
+  <exec_depend>a_star_banana</exec_depend>
+
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
