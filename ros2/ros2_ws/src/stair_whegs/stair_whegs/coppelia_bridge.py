@@ -8,11 +8,25 @@ dois conhece o CoppeliaSim.
     pose do chassi                 --->   pose          geometry_msgs/PoseStamped
     atitude do dummy imu           --->   attitude      geometry_msgs/Vector3Stamped
                                    --->   /tf           world -> base_link
-    as quatro juntas de wheg       --->   wheg_state    sensor_msgs/JointState
+    as juntas de tração e de perna --->   wheg_state    sensor_msgs/JointState
     probe_l, probe_r, edge         --->   probes        std_msgs/Float64MultiArray
     relógio da simulação           --->   sim_time      std_msgs/Float64
-    as quatro juntas de wheg       <---   wheg_joints   std_msgs/Float64MultiArray
+    as quatro juntas de tração     <---   wheg_joints   std_msgs/Float64MultiArray
+    o estado das rodas             <---   wheel_mode    std_msgs/String
     parar a simulação              <---   done          std_msgs/Bool
+
+O DISCO TRANSMISSOR VIRA UMA LINHA DE CÓDIGO
+--------------------------------------------
+Cada roda tem três juntas de perna, e na roda de verdade elas não são
+independentes: um disco transmissor as acopla, e as três abrem juntas. Aqui o
+acoplamento é esta ponte escrevendo o MESMO alvo nas doze juntas. É uma
+simplificação declarada, e tem a propriedade que interessa — nenhum nó acima
+consegue pedir uma roda meio aberta, que no mecanismo real também não existe.
+
+O tópico fala em NOMES de estado ("roda", "garra") e não em radianos, pelo
+mesmo motivo: quem decide é o `climber`, e o que ele sabe é que está no plano
+ou atacando um degrau. O ângulo é assunto da geometria da roda, e mora em
+`geometry.WHEEL_MODES`.
 
 A ATITUDE VEM DE UM DUMMY, NÃO DO CHASSI
 ----------------------------------------
@@ -48,9 +62,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float64, Float64MultiArray
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 import tf2_ros
 
+from stair_whegs import geometry
 from stair_whegs.geometry import WHEGS
 
 #: Nomes dos três sensores, na ordem em que saem no tópico `probes`.
@@ -70,6 +85,7 @@ class CoppeliaBridge(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('autostart', True)
         self.declare_parameter('wheg_torque', 2.0)        # [N.m]
+        self.declare_parameter('leg_torque', geometry.LEG_TORQUE)   # [N.m]
         self.declare_parameter('cmd_timeout', 0.5)        # [s]
         # Em stepping a ponte é quem dá os passos da simulação, e cada passo
         # leva um comando calculado a partir do estado daquele mesmo passo. É a
@@ -90,7 +106,12 @@ class CoppeliaBridge(Node):
         self.chassis = self.find(f'{rover}/chassis', 'o corpo do rover')
         self.imu = self.find(f'{rover}/chassis/imu', 'o referencial de atitude')
         self.joints = [self.find(f'{rover}/chassis/{name}_joint',
-                                 f'a junta do wheg {name}') for name in WHEGS]
+                                 f'a junta de tração de {name}')
+                       for name in WHEGS]
+        # As juntas de perna moram dentro da roda: tração -> cubo -> perna.
+        # Quantas são não está escrito aqui: a ponte CONTA o que a cena tem,
+        # para um rover de quatro pernas por roda funcionar sem mexer nisto.
+        self.legs = {name: self.find_legs(rover, name) for name in WHEGS}
         self.probes = [self.find(f'{rover}/chassis/{name}', f'o sensor {name}')
                        for name in PROBES]
         # O alcance de cada sensor é lido DA CENA, e não repetido aqui: se
@@ -104,6 +125,13 @@ class CoppeliaBridge(Node):
                                          self.sim.jointintparam_dynctrlmode,
                                          self.sim.jointdynctrl_position)
             self.sim.setJointTargetForce(joint, torque)
+        leg_torque = self.get_parameter('leg_torque').value
+        for joints in self.legs.values():
+            for joint in joints:
+                self.sim.setObjectInt32Param(
+                    joint, self.sim.jointintparam_dynctrlmode,
+                    self.sim.jointdynctrl_position)
+                self.sim.setJointTargetForce(joint, leg_torque)
 
         self.started_here = (
             self.get_parameter('autostart').value
@@ -115,6 +143,10 @@ class CoppeliaBridge(Node):
 
         self.targets = None               # últimas posições de junta pedidas
         self.deadline = 0.0
+        # A roda nasce FECHADA, que é como a cena foi construída. Não há
+        # `None` aqui, e não por descuido: sem comando a roda tem de estar num
+        # dos dois estados, e o que não cai é o fechado.
+        self.wheel_mode = geometry.RODA
         self.done = threading.Event()
 
         self.pose_pub = self.create_publisher(PoseStamped, 'pose', 10)
@@ -124,6 +156,8 @@ class CoppeliaBridge(Node):
         self.sim_time_pub = self.create_publisher(Float64, 'sim_time', 10)
         self.create_subscription(Float64MultiArray, 'wheg_joints',
                                  self.joints_callback, 10)
+        self.create_subscription(String, 'wheel_mode',
+                                 self.wheel_callback, 10)
         self.create_subscription(Bool, 'done', self.done_callback, 10)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
@@ -141,8 +175,11 @@ class CoppeliaBridge(Node):
             self.create_timer(1.0 / rate, self.publish_state)
             self.create_timer(1.0 / rate, self.actuate)
 
+        legs = sum(len(joints) for joints in self.legs.values())
         self.get_logger().info(
-            f'ponte pronta. comandos em {self.resolve_topic_name("wheg_joints")}')
+            f'ponte pronta: 4 juntas de tração e {legs} de perna. '
+            f'comandos em {self.resolve_topic_name("wheg_joints")} e '
+            f'{self.resolve_topic_name("wheel_mode")}')
 
     # =========================================================================
     #  Conexão
@@ -168,6 +205,27 @@ class CoppeliaBridge(Node):
             f'não há "{path}" na cena{f" ({what})" if what else ""}.\n'
             'Monte a cena com scene/build_scene.py. A cena tem:\n  '
             + '\n  '.join(existing))
+
+    def find_legs(self, rover, name):
+        """As juntas de perna de uma roda, na ordem em que a cena as nomeou.
+
+        Procura `<rover>/chassis/<name>_joint/<name>_hub/<name>_leg<k>_joint`
+        até não achar mais. Contar em vez de assumir três deixa a ponte servir
+        a uma roda de quatro pernas (`build_scene.py --spokes 4`) sem edição.
+        """
+        joints = []
+        while True:
+            path = (f'{rover}/chassis/{name}_joint/{name}_hub/'
+                    f'{name}_leg{len(joints)}_joint')
+            handle = self.sim.getObject(path, {'noError': True})
+            if handle == -1:
+                break
+            joints.append(handle)
+        if not joints:
+            self.find(f'{rover}/chassis/{name}_joint/{name}_hub/'
+                      f'{name}_leg0_joint',
+                      f'a primeira junta de perna da roda {name}')
+        return joints
 
     # =========================================================================
     #  Um ciclo
@@ -225,11 +283,21 @@ class CoppeliaBridge(Node):
         transform.transform.rotation.w = pose.pose.orientation.w
         self.tf_broadcaster.sendTransform(transform)
 
+        # As juntas de tração vêm primeiro, com os nomes de sempre: quem só
+        # quer a marcha (`gait`) continua lendo `dict(zip(name, position))` e
+        # achando o que procura. Depois delas vai uma entrada por roda com o
+        # ângulo da PRIMEIRA perna — as três são iguais por construção, e
+        # publicar as doze só encheria o tópico.
+        # Montado numa lista só e atribuído de uma vez: `state.position` vira
+        # um `array` de doubles assim que recebe o primeiro valor, e um `+=`
+        # com lista depois disso levanta TypeError.
+        positions = [self.sim.getJointPosition(joint) for joint in self.joints]
+        positions += [self.sim.getJointPosition(self.legs[name][0])
+                      for name in WHEGS]
         state = JointState()
         state.header.stamp = stamp
-        state.name = list(WHEGS)
-        state.position = [self.sim.getJointPosition(joint)
-                          for joint in self.joints]
+        state.name = list(WHEGS) + [f'{name}_leg' for name in WHEGS]
+        state.position = positions
         self.state_pub.publish(state)
 
         readings = []
@@ -272,6 +340,28 @@ class CoppeliaBridge(Node):
         self.targets = list(msg.data)
         self.deadline = time.monotonic() + self.get_parameter('cmd_timeout').value
 
+    def wheel_callback(self, msg: String):
+        """Fecha ou abre as rodas.
+
+        Vale para as quatro de uma vez. Não é preguiça: no mecanismo original
+        a transformação de cada roda é disparada pelo atrito na perna gatilho
+        DAQUELA roda, e o que substitui esse gatilho aqui é a percepção do
+        `climber`, que enxerga o terreno à frente do rover inteiro e não de
+        uma roda.
+        """
+        mode = msg.data.strip()
+        if mode == self.wheel_mode:
+            return
+        try:
+            geometry.wheel_angle(mode)
+        except KeyError as error:
+            self.get_logger().warn(str(error))
+            return
+        self.wheel_mode = mode
+        self.get_logger().info(
+            f'roda -> {mode} '
+            f'({math.degrees(geometry.wheel_angle(mode)):+.0f}° por perna)')
+
     def done_callback(self, msg: Bool):
         if msg.data and not self.done.is_set():
             self.get_logger().info('missão terminou: encerrando a ponte')
@@ -292,6 +382,20 @@ class CoppeliaBridge(Node):
             self.deadline = time.monotonic() + 1e9    # congela aqui até voltar
         for joint, target in zip(self.joints, self.targets):
             self.sim.setJointTargetPosition(joint, target)
+        self.actuate_legs()
+
+    def actuate_legs(self):
+        """O mesmo alvo nas três pernas de cada roda: é o disco transmissor.
+
+        Vai fora do `cmd_timeout` de propósito. Perder o comando de marcha
+        significa parar de girar, e parar de girar com a roda aberta é
+        legítimo — fechar a roda sozinho, no meio de um degrau, deixaria o
+        rover sentado na quina.
+        """
+        angle = geometry.wheel_angle(self.wheel_mode)
+        for joints in self.legs.values():
+            for joint in joints:
+                self.sim.setJointTargetPosition(joint, angle)
 
     def stop(self):
         try:

@@ -5,12 +5,14 @@ Não há modelo de rover de whegs no CoppeliaSim: este script o CONSTRÓI, peça
 por peça, pela ZeroMQ Remote API. É a parte do trabalho que normalmente se
 faria na interface gráfica, e fazê-la em código tem três consequências boas:
 a cena é reproduzível a partir de uma semente de parâmetros, a geometria do
-robô vira variável de experimento (`--wheg-radius`, `--spokes`, `--tail`), e
-cada decisão de projeto fica escrita ao lado do código que a executa.
+robô vira variável de experimento (`--wheg-radius`, `--spokes`, `--leg-open`,
+`--tail`), e cada decisão de projeto fica escrita ao lado do código que a
+executa.
 
     python3 scene/build_scene.py                      # rover e escada padrão
     python3 scene/build_scene.py --riser 0.05         # degrau mais alto
     python3 scene/build_scene.py --wheg-radius 0.065 --spokes 4
+    python3 scene/build_scene.py --leg-open 60        # garra que abre menos
     python3 scene/build_scene.py --no-tail            # para ver o capotamento
     python3 scene/build_scene.py --no-save
 
@@ -19,7 +21,11 @@ O que a cena tem
     /rover/chassis            o corpo, com a cauda incorporada
     /rover/chassis/imu        dummy alinhado ao mundo: é por ele que a atitude
                               é medida (ver abaixo)
-    /rover/chassis/<w>_joint  as quatro juntas de wheg (fl, fr, rl, rr)
+    /rover/chassis/<w>_joint  as quatro juntas de TRAÇÃO (fl, fr, rl, rr)
+    .../<w>_joint/<w>_hub     o quadro em Y de cada roda transformável
+    .../<w>_leg<k>_joint      as três juntas de PERNA de cada roda, k = 0..2.
+                              Zero fecha a roda num aro; -LEG_OPEN a abre em
+                              catavento (ver `add_wheel`)
     /rover/chassis/front_l    sensores de proximidade à frente, à altura do
     /rover/chassis/front_r    espelho: detectam a escada e o desalinhamento
     /rover/chassis/edge       sensor apontado para baixo e à frente: detecta a
@@ -153,51 +159,181 @@ def add_stairs(sim, riser, tread, steps, width, x0, landing):
 #  O rover
 # =============================================================================
 
-def spoke_parts(sim, center, radius, spokes, curve, width=0.008, thick=0.016):
-    """As peças de um wheg: `spokes` raios curvos mais o cubo.
+#: Máscara de resposta a colisão: só o byte ALTO ligado.
+#:
+#: O CoppeliaSim só faz dois shapes colidirem se as máscaras deles tiverem um
+#: bit em comum, e o byte BAIXO vale apenas entre peças da mesma árvore
+#: dinâmica. Zerá-lo faz o rover não colidir consigo mesmo — e aqui isso virou
+#: obrigatório: as três pernas de uma roda emendam umas nas outras quando
+#: fechadas, e com a máscara cheia o motor de física passa a vida resolvendo o
+#: contato entre elas, o que trava a roda em vez de fechá-la.
+NO_SELF_COLLISION = 0xff00
 
-    Cada raio é aproximado por quatro cuboides ao longo de um arco. O arco
-    ATRASA em relação ao sentido de giro conforme se afasta do cubo — é o que
-    dá a forma de garra da figura, e o que faz a ponta varrer a quina do
-    degrau em vez de bater nela de frente.
 
-    Os cuboides são peças CONVEXAS, e o CoppeliaSim trata o shape agrupado
-    como um conjunto delas. Uma malha curva única seria côncava, e aí o motor
-    de física produz contatos errados — o mesmo problema que a banana do
-    trabalho anterior deu, e pela mesma razão.
+def arc_parts(sim, center, radius, start, span, width, thick, segments=8):
+    """Um arco de circunferência, aproximado por `segments` cuboides.
+
+    `center` é o centro do arco no MUNDO, `radius` o raio da linha média,
+    `start` o ângulo inicial e `span` quanto de ângulo o arco cobre. O arco
+    vive no plano x-z do mundo, que é o plano em que as rodas giram.
+
+    São cuboides, e não uma malha curva, porque cada cuboide é CONVEXO e o
+    CoppeliaSim trata o shape agrupado como um conjunto de convexos. Uma casca
+    curva única seria côncava, e o motor de física produz contatos errados com
+    ela — o mesmo problema que a banana do trabalho anterior deu.
+
+    `segments` é o que decide o quanto o aro FECHADO é redondo de verdade, e é
+    um compromisso com o custo: cada cuboide é um corpo convexo que o motor de
+    física testa a cada passo, e são `4 x spokes x segments` deles no rover
+    inteiro. Com 8 por perna a flecha de cada corda vale
+    `radius(1 - cos(span/2n))`, uns 0,1 mm na roda padrão — menos de um décimo
+    do que o aro balança por outras razões — e o rover fica com 96 convexos,
+    que a simulação aguenta em tempo útil.
+    """
+    x, y, z = center
+    parts = []
+    for piece in range(segments):
+        a0 = start + span * piece / segments
+        a1 = start + span * (piece + 1) / segments
+        p0 = (radius * math.cos(a0), radius * math.sin(a0))
+        p1 = (radius * math.cos(a1), radius * math.sin(a1))
+        middle = ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
+        length = math.dist(p0, p1)
+        angle = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+        # 1,15 de sobra no comprimento para os cuboides se sobreporem: sem
+        # isso ficam frestas entre eles, e a quina do degrau entra nelas.
+        segment = sim.createPrimitiveShape(
+            sim.primitiveshape_cuboid, [length * 1.15, width, thick], 0)
+        sim.setObjectPosition(segment, sim.handle_world,
+                              [x + middle[0], y, z + middle[1]])
+        # O wheg gira no plano x-z do mundo; o eixo da junta é o y.
+        sim.setObjectOrientation(segment, sim.handle_world,
+                                 [math.pi / 2.0, -angle, 0.0])
+        parts.append(segment)
+    return parts
+
+
+def hub_parts(sim, center, pivot_radius, spokes, width=0.007, thick=0.007):
+    """O quadro da roda: o cubo central e um braço até o eixo de cada perna.
+
+    É a peça em Y da roda original. Ela não toca o chão em nenhum dos dois
+    estados — quem toca é sempre a perna — e por isso é fina: o que ela faz é
+    segurar os eixos das pernas no lugar certo do aro.
     """
     x, y, z = center
     parts = []
     for index in range(spokes):
-        base = 2.0 * math.pi * index / spokes
-        segments = 4
-        for piece in range(segments):
-            start, end = piece / segments, (piece + 1) / segments
-            r0 = 0.012 + (radius - 0.012) * start
-            r1 = 0.012 + (radius - 0.012) * end
-            a0 = base - curve * start
-            a1 = base - curve * end
-            p0 = (r0 * math.cos(a0), r0 * math.sin(a0))
-            p1 = (r1 * math.cos(a1), r1 * math.sin(a1))
-            middle = ((p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0)
-            length = math.dist(p0, p1)
-            angle = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
-            # 1,15 de sobra no comprimento para os cuboides se sobreporem: sem
-            # isso ficam frestas entre eles, e a quina do degrau entra nelas.
-            segment = sim.createPrimitiveShape(
-                sim.primitiveshape_cuboid, [length * 1.15, width, thick], 0)
-            sim.setObjectPosition(segment, sim.handle_world,
-                                  [x + middle[0], y, z + middle[1]])
-            # O wheg gira no plano x-z do mundo; o eixo da junta é o y.
-            sim.setObjectOrientation(segment, sim.handle_world,
-                                     [math.pi / 2.0, -angle, 0.0])
-            parts.append(segment)
-    hub = sim.createPrimitiveShape(
-        sim.primitiveshape_cylinder, [0.022, 0.022, 0.012], 0)
-    sim.setObjectPosition(hub, sim.handle_world, [x, y, z])
-    sim.setObjectOrientation(hub, sim.handle_world, [math.pi / 2.0, 0.0, 0.0])
-    parts.append(hub)
+        angle = 2.0 * math.pi * index / spokes
+        arm = sim.createPrimitiveShape(
+            sim.primitiveshape_cuboid, [pivot_radius, width, thick], 0)
+        sim.setObjectPosition(
+            arm, sim.handle_world,
+            [x + pivot_radius / 2.0 * math.cos(angle), y,
+             z + pivot_radius / 2.0 * math.sin(angle)])
+        sim.setObjectOrientation(arm, sim.handle_world,
+                                 [math.pi / 2.0, -angle, 0.0])
+        parts.append(arm)
+    core = sim.createPrimitiveShape(
+        sim.primitiveshape_cylinder, [0.020, 0.020, 0.014], 0)
+    sim.setObjectPosition(core, sim.handle_world, [x, y, z])
+    sim.setObjectOrientation(core, sim.handle_world, [math.pi / 2.0, 0.0, 0.0])
+    parts.append(core)
     return parts
+
+
+def add_wheel(sim, name, center, drive_joint, args):
+    """Uma roda transformável inteira, presa à junta de tração.
+
+    A árvore dinâmica que sai daqui:
+
+        <junta de tração>  ->  cubo  ->  <junta de perna> x3  ->  perna x3
+
+    FECHADA (perna em 0°) os três dorsos emendam e formam um aro de raio
+    `args.wheg_radius`: rola como roda, sem balanço. ABERTA (perna no outro
+    extremo do intervalo) as pontas saem para fora em catavento e alcançam
+    `geometry.claw_reach()`, quase o dobro.
+
+    O ZERO É UM BATENTE, NÃO UMA POSIÇÃO DE CONTROLE
+    ------------------------------------------------
+    O intervalo da junta de perna vai de zero ao ângulo de abertura, do lado
+    que `geometry.LEG_RAKE` mandar. Com a roda fechada, o peso do rover
+    empurra a perna CONTRA o batente em zero, e quem segura é o batente — o
+    motor da perna fica sem carga.
+
+    Que seja sempre assim é geometria, não sorte: o ponto de contato no chão
+    fica sempre adiante do eixo da perna, no mesmo sentido em que ela fecha, e
+    por isso qualquer carga vertical fecha a roda em vez de abri-la. É o
+    equivalente, aqui, de as pernas fechadas do mecanismo original se apoiarem
+    umas nas outras — e é o que evita ter de pôr num motorzinho de perna o
+    torque que sustenta o robô.
+    """
+    radius = args.wheg_radius
+    spokes = args.spokes
+    pivot_radius = geometry.LEG_PIVOT * radius
+    # A espessura da casca é o que falta para a linha média virar o raio
+    # externo: assim a roda fechada tem exatamente `radius` de raio.
+    thick = 2.0 * (radius - pivot_radius)
+    span = geometry.leg_span(spokes)
+    # Uma fresta entre o fim de um dorso e o eixo da perna seguinte. Sem ela as
+    # pernas fechadas se tocam e não há como abrir sem raspar. Ela é um furo
+    # no aro, então quanto menor melhor: 2° valem 1,5 mm de arco na roda
+    # padrão, menos que a espessura da casca.
+    gap = math.radians(2.0)
+
+    hub = sim.groupShapes(hub_parts(sim, center, pivot_radius, spokes))
+    sim.setObjectAlias(hub, f'{name}_hub')
+    sim.setObjectInt32Param(hub, sim.shapeintparam_respondable, 1)
+    sim.setObjectInt32Param(hub, sim.shapeintparam_respondable_mask,
+                            NO_SELF_COLLISION)
+    sim.setObjectInt32Param(hub, sim.shapeintparam_static, 0)
+    sim.setShapeMass(hub, geometry.WHEG_MASS * 0.4)
+    sim.setShapeColor(hub, None, sim.colorcomponent_ambient_diffuse,
+                      [0.28, 0.30, 0.34])
+    sim.setObjectParent(hub, drive_joint, True)
+
+    legs = []
+    for index in range(spokes):
+        base = 2.0 * math.pi * index / spokes
+        # `LEG_RAKE` decide para que lado o dorso sai do eixo da perna, e com
+        # isso se a PONTA chega ao degrau antes ou depois do eixo. Ver o
+        # comentário dele em geometry.py: com o sinal trocado o rover empina
+        # 72° no primeiro degrau e não sobe.
+        rake = geometry.LEG_RAKE
+        leg = sim.groupShapes(arc_parts(
+            sim, center, pivot_radius, base + rake * gap / 2.0,
+            rake * (span - gap), width=args.leg_width, thick=thick))
+        sim.setObjectAlias(leg, f'{name}_leg{index}')
+        sim.setObjectInt32Param(leg, sim.shapeintparam_respondable, 1)
+        sim.setObjectInt32Param(leg, sim.shapeintparam_respondable_mask,
+                                NO_SELF_COLLISION)
+        sim.setObjectInt32Param(leg, sim.shapeintparam_static, 0)
+        sim.setShapeMass(leg, geometry.WHEG_MASS * 0.6 / spokes)
+        sim.setShapeColor(leg, None, sim.colorcomponent_ambient_diffuse,
+                          [0.52, 0.53, 0.56])
+
+        joint = sim.createJoint(sim.joint_revolute, sim.jointmode_dynamic, 0)
+        sim.setObjectAlias(joint, f'{name}_leg{index}_joint')
+        sim.setObjectPosition(
+            joint, sim.handle_world,
+            [center[0] + pivot_radius * math.cos(base), center[1],
+             center[2] + pivot_radius * math.sin(base)])
+        sim.setObjectOrientation(joint, sim.handle_world,
+                                 [math.pi / 2.0, 0.0, 0.0])
+        # A API recebe (mínimo, AMPLITUDE), e não (mínimo, máximo). O
+        # intervalo vai de zero ao ângulo de abertura, do lado que `LEG_RAKE`
+        # mandar: os dois estados da roda são os dois extremos dele, e o zero
+        # — a roda fechada — é um batente de verdade.
+        sim.setJointInterval(
+            joint, False,
+            [min(0.0, -rake * args.leg_open), args.leg_open])
+        sim.setObjectParent(joint, hub, True)
+        sim.setObjectParent(leg, joint, True)
+        sim.setObjectInt32Param(joint, sim.jointintparam_dynctrlmode,
+                                sim.jointdynctrl_position)
+        sim.setJointTargetForce(joint, geometry.LEG_TORQUE)
+        sim.setJointTargetPosition(joint, 0.0)
+        legs.append(joint)
+    return hub, legs
 
 
 def add_rover(sim, args):
@@ -219,6 +355,8 @@ def add_rover(sim, args):
     sim.setObjectPosition(chassis, sim.handle_world,
                           [args.start_x, 0.0, axle_z])
     sim.setObjectInt32Param(chassis, sim.shapeintparam_respondable, 1)
+    sim.setObjectInt32Param(chassis, sim.shapeintparam_respondable_mask,
+                            NO_SELF_COLLISION)
     sim.setObjectInt32Param(chassis, sim.shapeintparam_static, 0)
     sim.setShapeMass(chassis, geometry.CHASSIS_MASS)
     sim.setShapeColor(chassis, None, sim.colorcomponent_ambient_diffuse,
@@ -238,6 +376,8 @@ def add_rover(sim, args):
         sim.setShapeMass(tail, geometry.TAIL_MASS)
         chassis = sim.groupShapes([chassis, tail])
         sim.setObjectAlias(chassis, 'chassis')
+        sim.setObjectInt32Param(chassis, sim.shapeintparam_respondable_mask,
+                                NO_SELF_COLLISION)
         sim.setShapeColor(chassis, None, sim.colorcomponent_ambient_diffuse,
                           [0.30, 0.35, 0.40])
     sim.setObjectParent(chassis, parent, True)
@@ -255,16 +395,6 @@ def add_rover(sim, args):
                        ('fr', +half_base, -half_track),
                        ('rl', -half_base, +half_track),
                        ('rr', -half_base, -half_track)):
-        parts = spoke_parts(sim, (args.start_x + x, y, axle_z),
-                            radius, args.spokes, args.curve)
-        wheg = sim.groupShapes(parts)
-        sim.setObjectAlias(wheg, name)
-        sim.setObjectInt32Param(wheg, sim.shapeintparam_respondable, 1)
-        sim.setObjectInt32Param(wheg, sim.shapeintparam_static, 0)
-        sim.setShapeMass(wheg, geometry.WHEG_MASS)
-        sim.setShapeColor(wheg, None, sim.colorcomponent_ambient_diffuse,
-                          [0.45, 0.45, 0.48])
-
         joint = sim.createJoint(sim.joint_revolute, sim.jointmode_dynamic, 0)
         sim.setObjectAlias(joint, f'{name}_joint')
         sim.setObjectPosition(joint, sim.handle_world,
@@ -272,10 +402,10 @@ def add_rover(sim, args):
         sim.setObjectOrientation(joint, sim.handle_world,
                                  [math.pi / 2.0, 0.0, 0.0])
         sim.setObjectParent(joint, chassis, True)
-        sim.setObjectParent(wheg, joint, True)
         sim.setObjectInt32Param(joint, sim.jointintparam_dynctrlmode,
                                 sim.jointdynctrl_position)
         sim.setJointTargetForce(joint, geometry.WHEG_TORQUE)
+        add_wheel(sim, name, (args.start_x + x, y, axle_z), joint, args)
         joints[name] = joint
 
     add_sensors(sim, chassis, args, axle_z, body_length)
@@ -385,11 +515,16 @@ def main():
 
     rover = parser.add_argument_group('rover')
     rover.add_argument('--wheg-radius', type=float, default=geometry.WHEG_RADIUS,
-                       help='raio do wheg [m]; ele vence degraus de até ~1 raio')
+                       help='raio da roda FECHADA [m]; aberta, a garra alcança '
+                            'quase o dobro')
     rover.add_argument('--spokes', type=int, default=geometry.SPOKES,
-                       help='raios por wheg; menos sobe melhor e anda pior')
-    rover.add_argument('--curve', type=float, default=geometry.SPOKE_CURVE,
-                       help='curvatura do raio [rad]; 0 dá raio reto')
+                       help='pernas por roda; menos sobe melhor e anda pior')
+    rover.add_argument('--leg-open', type=float,
+                       default=math.degrees(geometry.LEG_OPEN),
+                       help='quanto a perna abre [graus]; mais alcança mais '
+                            'alto e apoia pior')
+    rover.add_argument('--leg-width', type=float, default=0.012,
+                       help='largura da perna [m]')
     rover.add_argument('--wheelbase', type=float, default=geometry.WHEELBASE)
     rover.add_argument('--track', type=float, default=geometry.TRACK)
     rover.add_argument('--body-height', type=float, default=0.030)
@@ -414,6 +549,9 @@ def main():
 
     parser.add_argument('--no-save', action='store_true')
     args = parser.parse_args()
+    # A linha de comando fala em graus porque é como se pensa num ângulo de
+    # abertura; o resto do programa fala em radianos, como todo o pacote.
+    args.leg_open = math.radians(args.leg_open)
 
     try:
         client = RemoteAPIClient(args.host, args.port)
@@ -428,20 +566,34 @@ def main():
 
     info = build(sim, args)
 
-    print(f'rover: wheg de {args.wheg_radius * 1000:.0f} mm com {args.spokes} '
-          f'raios, entre-eixos {args.wheelbase * 1000:.0f} mm, '
+    reach = geometry.claw_reach(args.wheg_radius, args.leg_open, args.spokes)
+    print(f'rover: roda de {args.wheg_radius * 1000:.0f} mm com {args.spokes} '
+          f'pernas, entre-eixos {args.wheelbase * 1000:.0f} mm, '
           + (f'cauda de {args.tail * 1000:.0f} mm' if args.tail else 'SEM CAUDA'))
-    print(f'  eixo a {info["axle_z"] * 1000:.0f} mm do chão | '
-          f'balanço do corpo por passo: '
-          f'{geometry.body_bounce(args.wheg_radius, args.spokes) * 1000:.1f} mm')
+    print(f'  fechada: aro de {args.wheg_radius * 1000:.0f} mm, balanço 0 mm')
+    print(f'  aberta ({math.degrees(args.leg_open):.0f}°): garra alcança '
+          f'{reach * 1000:.0f} mm ({reach / args.wheg_radius:.2f} raios), '
+          f'balanço do corpo por passo '
+          f'{geometry.body_bounce(reach, args.spokes) * 1000:.1f} mm')
+    catch = geometry.tail_catch_angle(reach, tail=args.tail,
+                                      wheelbase=args.wheelbase)
+    print(f'  eixo a {info["axle_z"] * 1000:.0f} mm do chão fechada, '
+          f'{reach * 1000:.0f} mm aberta')
+    print(f'  cauda pega aos '
+          f'{math.degrees(catch) if catch else float("nan"):.0f}° de pitch, '
+          f'razão garra/entre-eixos {reach / args.wheelbase:.2f}')
     print(f'escada: {args.steps} degraus de {args.riser * 1000:.0f} x '
           f'{args.tread * 1000:.0f} mm, de x={args.stair_x:.2f} a '
           f'x={info["top_x"]:.2f}, topo a {info["top_z"] * 1000:.0f} mm')
     print(f'  patamar de {args.landing * 1000:.0f} mm')
-    ratio = args.riser / args.wheg_radius
-    print(f'  degrau / raio do wheg = {ratio:.2f}'
-          + ('  (acima de 1,0 o raio bate na face em vez de enganchar a quina)'
+    ratio = args.riser / reach
+    print(f'  degrau / alcance da garra = {ratio:.2f}'
+          + ('  (acima de 1,0 a ponta bate na face em vez de enganchar a quina)'
              if ratio > 1.0 else ''))
+    print(f'  degrau / raio da roda fechada = '
+          f'{args.riser / args.wheg_radius:.2f}'
+          + ('  (acima de ~1 raio o aro fechado não alcança a quina)'
+             if args.riser > args.wheg_radius else ''))
 
     if args.no_save:
         print('\n--no-save: a cena ficou na memória, sem gravar.')

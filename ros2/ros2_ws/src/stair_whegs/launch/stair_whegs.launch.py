@@ -2,7 +2,7 @@
 
     ros2 launch stair_whegs stair_whegs.launch.py
     ros2 launch stair_whegs stair_whegs.launch.py climb_speed:=2.0
-    ros2 launch stair_whegs stair_whegs.launch.py gait:=junta     # a que falha
+    ros2 launch stair_whegs stair_whegs.launch.py climb_gait:=alternada
     ros2 launch stair_whegs stair_whegs.launch.py window:=0.4
 
 Antes de rodar, a cena tem de existir:
@@ -13,7 +13,12 @@ Cadeia que sobe:
 
     coppelia_bridge -- probes, attitude, pose --> climber
     climber         -- drive, gait            --> gait
+    climber         -- wheel_mode             --> coppelia_bridge
     gait            -- wheg_joints            --> coppelia_bridge
+
+A marcha gira as rodas; o `wheel_mode` decide se elas são RODA (aro fechado,
+para andar no plano) ou GARRA (pernas abertas em catavento, para subir). Quem
+escolhe é o `climber`, a partir das sondas — ver o cabeçalho dele.
 """
 
 from launch import LaunchDescription
@@ -29,9 +34,14 @@ def generate_launch_description():
                               description='Caminho do rover na cena'),
         DeclareLaunchArgument('port', default_value='23000',
                               description='Porta da ZeroMQ Remote API'),
-        DeclareLaunchArgument('gait', default_value='alternada',
-                              description='Marcha: alternada, dianteira ou '
-                                          'junta (esta última não sobe)'),
+        DeclareLaunchArgument('search_gait', default_value='alternada',
+                              description='Marcha no plano: alternada, '
+                                          'dianteira ou junta'),
+        DeclareLaunchArgument('climb_gait', default_value='junta',
+                              description='Marcha na escada. junta porque a '
+                                          'alternada balança o corpo em '
+                                          'rolagem e capota com a garra '
+                                          'aberta'),
         DeclareLaunchArgument('search_speed', default_value='3.0',
                               description='Velocidade dos whegs no plano [rad/s]'),
         DeclareLaunchArgument('climb_speed', default_value='3.0',
@@ -42,6 +52,9 @@ def generate_launch_description():
         DeclareLaunchArgument('step_ratio', default_value='0.70',
                               description='Fração da leitura de piso plano '
                                           'abaixo da qual há degrau'),
+        DeclareLaunchArgument('transform_time', default_value='0.8',
+                              description='Tempo parado enquanto as pernas '
+                                          'abrem ou fecham [s de simulação]'),
         DeclareLaunchArgument('stop_when_done', default_value='true'),
     ]
 
@@ -63,7 +76,7 @@ def generate_launch_description():
         package='stair_whegs', namespace=namespace,
         executable='gait', name='gait', output='screen',
         parameters=[{
-            'gait': LaunchConfiguration('gait'),
+            'gait': LaunchConfiguration('search_gait'),
         }],
     )
 
@@ -79,8 +92,10 @@ def generate_launch_description():
                                      value_type=float),
             'step_ratio': ParameterValue(LaunchConfiguration('step_ratio'),
                                          value_type=float),
-            'search_gait': LaunchConfiguration('gait'),
-            'climb_gait': LaunchConfiguration('gait'),
+            'transform_time': ParameterValue(
+                LaunchConfiguration('transform_time'), value_type=float),
+            'search_gait': LaunchConfiguration('search_gait'),
+            'climb_gait': LaunchConfiguration('climb_gait'),
             'stop_when_done': ParameterValue(LaunchConfiguration('stop_when_done'),
                                              value_type=bool),
         }],

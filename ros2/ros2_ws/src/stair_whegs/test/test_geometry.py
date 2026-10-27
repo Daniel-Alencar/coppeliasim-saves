@@ -17,8 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from stair_whegs import geometry  # noqa: E402  (precisa do sys.path acima)
 from stair_whegs.geometry import (  # noqa: E402
-    GAITS, SPOKES, WHEGS, gait_targets, longest_gap, max_riser, phases,
-    rephase, stair_height, step_angle)
+    GAITS, GARRA, RODA, SPOKES, WHEGS, claw_reach, claw_tip, gait_targets,
+    leg_span, longest_gap, max_riser, phases, rephase, stair_height,
+    step_angle, wheel_angle)
 
 
 # =============================================================================
@@ -156,22 +157,111 @@ def test_vao_sem_apoio_separa_as_marchas():
     assert longest_gap('junta') == pytest.approx(1.0)
 
 
-def test_balanco_do_corpo_cresce_quando_ha_menos_raios():
-    """Menos raios, mais balanço: é o preço de não ter aro."""
+def test_balanco_do_corpo_cresce_quando_ha_menos_pernas():
+    """Menos pernas abertas, mais balanço: é o preço de abrir o aro."""
     bounce = [geometry.body_bounce(0.05, n) for n in (2, 3, 4, 6)]
     assert bounce == sorted(bounce, reverse=True)
-    # Com três raios, metade de um raio... não: 1 - cos(60°) = 0,5.
+    # Com três pernas abertas, 1 - cos(60°) = 0,5 de raio.
     assert geometry.body_bounce(0.05, 3) == pytest.approx(0.025)
-    # Com muitos raios a roda vira aro e o balanço some.
+    # Com muitas pernas a garra vira aro e o balanço some.
     assert geometry.body_bounce(0.05, 36) < 0.001
 
 
-def test_degrau_vencivel_vem_da_medida_e_nao_do_raio():
-    """CLIMB_RATIO é medido: o rover sobe MAIS que um raio, não menos."""
+def test_a_roda_fechada_nao_balanca():
+    """É a vantagem inteira do mecanismo transformável: FECHADA não há vão."""
+    assert geometry.body_bounce(0.05, 3, mode=RODA) == 0.0
+    assert geometry.body_bounce(0.05, 3, mode=GARRA) > 0.0
+
+
+def test_degrau_vencivel_vem_da_medida_e_do_alcance_da_garra():
+    """CLIMB_RATIO é medido, e se aplica ao alcance da GARRA."""
     assert geometry.CLIMB_RATIO > 1.0
-    assert max_riser(0.05) == pytest.approx(0.05 * geometry.CLIMB_RATIO)
+    assert max_riser(0.05) == pytest.approx(
+        geometry.CLIMB_RATIO * claw_reach(0.05))
     # O degrau padrão da cena tem de caber com folga.
     assert geometry.RISER < max_riser()
+
+
+# =============================================================================
+#  A roda transformável
+# =============================================================================
+
+def test_as_pernas_fechadas_cobrem_a_volta_inteira():
+    """É o que faz a roda FECHAR: os dorsos têm de emendar sem sobra."""
+    for spokes in (2, 3, 4, 5):
+        assert leg_span(spokes) * spokes == pytest.approx(2.0 * math.pi)
+
+
+def test_fechada_a_ponta_esta_sobre_o_aro():
+    """Com perna em zero, a ponta de uma perna é o eixo da perna seguinte."""
+    tip = claw_tip(0.05, open_angle=0.0)
+    assert math.hypot(*tip) == pytest.approx(geometry.LEG_PIVOT * 0.05)
+    assert claw_reach(0.05, open_angle=0.0) == pytest.approx(
+        geometry.LEG_PIVOT * 0.05)
+
+
+def test_abrir_a_perna_afasta_a_ponta_do_centro():
+    """Monotonia: cada grau a mais de abertura alcança mais longe.
+
+    É o que justifica `LEG_OPEN` ser escolhido pelo apoio, e não pelo
+    alcance — se houvesse um máximo interno, o ângulo sairia desta conta.
+    """
+    reach = [claw_reach(0.05, math.radians(d)) for d in range(0, 95, 5)]
+    assert reach == sorted(reach)
+
+
+def test_a_garra_aberta_alcanca_mais_que_o_aro():
+    """O que a transformação compra, com os valores padrão.
+
+    A faixa é larga de propósito: `LEG_OPEN` é um parâmetro de projeto e o
+    ensaio já o mudou uma vez (de 80° para 30°, ver o README §1.1). O que não
+    pode mudar é a garra alcançar MAIS que o aro — se deixar de alcançar, o
+    mecanismo perdeu a razão de existir.
+    """
+    ratio = claw_reach() / geometry.WHEG_RADIUS
+    assert 1.1 < ratio < 2.1
+    # E o alcance escala com o raio, como qualquer comprimento.
+    assert claw_reach(0.10) == pytest.approx(2.0 * claw_reach(0.05))
+
+
+def test_o_rover_aberto_fica_nas_proporcoes_que_sobem():
+    """As três contas que o ensaio mostrou serem o limite da abertura.
+
+    Não são gosto: com a garra de 98 mm o rover empinava a 90° e capotava em
+    qualquer bitola. Os limites aqui são a faixa em que a configuração medida
+    sobe a escada inteira (`scene/characterize.py abertura`, `bitola`).
+    """
+    reach = claw_reach()
+    # O braço que empina o rover na quina, contra o entre-eixos.
+    assert reach / geometry.WHEELBASE < 0.40
+    # A cauda tem de pegar o chão cedo, e nunca arrastar com a roda fechada.
+    aberto = geometry.tail_catch_angle(reach)
+    fechado = geometry.tail_catch_angle(geometry.WHEG_RADIUS)
+    assert aberto is not None and math.degrees(aberto) < 15.0
+    assert fechado is not None and math.degrees(fechado) > 0.0
+    # E a margem de tombamento lateral tem de sobreviver ao balanço de
+    # rolagem da marcha alternada, medido em +-14 graus no plano.
+    tipping = math.degrees(math.atan2(geometry.TRACK / 2.0, reach))
+    assert tipping > 45.0
+
+
+def test_os_dois_estados_sao_os_batentes_da_junta():
+    """Fechada é zero, aberta é o ângulo cheio: não há meio-termo nomeado."""
+    assert wheel_angle(RODA) == 0.0
+    assert abs(wheel_angle(GARRA)) == pytest.approx(geometry.LEG_OPEN)
+    with pytest.raises(KeyError):
+        wheel_angle('meia-garra')
+
+
+def test_abrir_e_sempre_contra_o_lado_do_dorso():
+    """O sinal da abertura sai de LEG_RAKE, e é o único que estica a garra.
+
+    Se os dois tivessem o mesmo sinal, a ponta passaria por DENTRO do aro e a
+    roda encolheria em vez de crescer — é a verificação que amarra os dois
+    constantes uma à outra.
+    """
+    assert wheel_angle(GARRA) * geometry.LEG_RAKE < 0.0
+    assert claw_reach() > geometry.LEG_PIVOT * geometry.WHEG_RADIUS
 
 
 # =============================================================================
@@ -198,7 +288,7 @@ def test_a_escada_para_de_subir_no_topo():
 
 
 def test_a_escada_da_cena_cabe_no_rover():
-    """O degrau padrão tem de estar dentro do que o wheg vence."""
+    """O degrau padrão tem de estar dentro do que a GARRA vence."""
     assert geometry.RISER <= max_riser(geometry.WHEG_RADIUS)
     # E o piso tem de ser mais fundo que o balanço, ou o rover nunca assenta.
     assert geometry.TREAD > 2 * geometry.body_bounce()
