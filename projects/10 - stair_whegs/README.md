@@ -18,7 +18,9 @@ colcon build --symlink-install --packages-select stair_whegs
 source install/setup.zsh
 
 cd src/stair_whegs
-python3 scene/build_scene.py            # monta e salva a cena
+python3 scene/build_scene.py
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
 ros2 launch stair_whegs stair_whegs.launch.py
 ```
 
