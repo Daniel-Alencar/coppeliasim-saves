@@ -31,6 +31,12 @@ não tem como saber que o corpo mudou de simulador.
 | [build_duck.py](build_duck.py) | Monta o pato na cena a partir do MJCF do próprio robô |
 | [duck_body.py](duck_body.py) | Serve o corpo na porta 7801, falando o protocolo do `duck-body` |
 | [poke_body.py](poke_body.py) | Exercita o corpo pelo protocolo, no lugar do `robotd` |
+| [walk.py](walk.py) | Roda a política de marcha do robô contra esse corpo |
+
+`policies/` guarda a política baixada do Hugging Face. Ela **não é autoria
+deste repositório** e não precisa ser versionada — o próprio Microduck a busca
+em vez de embarcar, porque um retreino de marcha não deve exigir uma release do
+daemon.
 
 ## Como rodar
 
@@ -45,7 +51,12 @@ python3 duck_body.py
 python3 poke_body.py --sweep left_knee
 python3 poke_body.py --limp
 
-# 3b. com o cérebro, do outro repositório
+# 3b. com a política de marcha do robô (ver §Andar)
+mkdir -p policies && curl -L -o policies/velstand.onnx \
+  https://huggingface.co/pollen-robotics/microduck-policies/resolve/main/velstand.onnx
+python3 walk.py --vx 0.15
+
+# 3c. com o cérebro inteiro, do outro repositório
 robotd --sim 127.0.0.1:7801
 ```
 
@@ -205,6 +216,97 @@ tem:
 Nenhuma das duas é impedimento de projeto — são instalações. A costura, que era
 a parte que podia não fechar, fechou.
 
+## Andar: até onde chegou
+
+Construir o `robotd` precisaria de uma toolchain Rust que a máquina não tem.
+Mas a parte do tique que faz o robô andar é pequena e está toda escrita no
+repositório do Microduck, então [walk.py](walk.py) a refaz em Python e roda a
+**política de verdade** — `velstand.onnx`, do conjunto oficial no Hugging Face:
+
+```
+duck-control/src/obs.rs     o vetor de observação, 61 floats
+robotd/src/control.rs       alvos ← pose de repouso + 0,9 × ação, mais dois filtros
+duck-control/src/policy.rs  quando a rede de postura substituiria a de marcha
+```
+
+### O que funcionou
+
+**O vetor de observação está certo.** É a parte que o `obs.rs` chama de código
+de maior risco do pacote — 61 floats em que um índice errado não falha, só
+produz um robô plausível que cai. Verificado rodando a política sozinha, sem
+simulador: mudar `vx` muda a ação de forma coerente e crescente, e `vyaw` e
+`vy` dão respostas distintas.
+
+| comando | ação \|max\| |
+|---|---|
+| parado, `vx` = 0,00 | 0,095 |
+| andar, `vx` = 0,15 | 0,175 |
+| andar forte, `vx` = 0,40 | 0,365 |
+| girar, `vyaw` = 1,00 | 0,312 |
+
+**A política é reativa, sem relógio interno.** Com o estado das juntas travado
+e a ação realimentada, ela converge para um ponto fixo: a oscilação pico-a-pico
+é exatamente zero em todas as catorze juntas. A marcha não está dentro da rede
+— ela nasce do **laço fechado com o corpo**. Isso tem uma consequência direta,
+e é a próxima seção.
+
+### O ganho do servo decide se existe marcha
+
+O padrão do CoppeliaSim é P = 0,1, e com ele um degrau de 0,3 rad no joelho
+leva **205 ms** para assentar — dez tiques de controle. A junta nunca chega ao
+alvo dentro do tique, a realimentação não se desenvolve, e o resultado medido
+foi um pato **de pé e parado**: ação de amplitude 0,15, tronco imóvel em
+x = −1,1 cm por 300 tiques.
+
+| P | em 20 ms | assenta | overshoot |
+|---|---|---|---|
+| 0,1 | 32 % | 205 ms | 0 |
+| **1,0** | **78 %** | **25 ms** | **0** |
+| 3,0 | 78 % | 25 ms | 0,032 rad |
+| 10 | 78 % | 25 ms | 0,053 rad |
+
+Com P = 1,0 a política passou a atuar de verdade — amplitude de ação de 1,26
+contra 0,15 — e o pato **deu um passo**, avançando 5,4 cm em dois segundos.
+A simulação também ficou mais rápida que o tempo real (1,17×), porque a física
+deixou de brigar com um servo mole.
+
+Uma armadilha de API no caminho: `sim.setObjectFloatParam(h,
+sim.jointfloatparam_pid_p, ...)` — o caminho antigo e óbvio — **aceita a
+escrita e não faz nada**; o valor lido de volta continua 0,1. O PID é por motor
+de física (`bullet.posPid`, `ode.posPid`, ...). Custou uma varredura inteira de
+ganho em que todas as linhas davam o mesmo número.
+
+### O que não funcionou
+
+O pato dá um ou dois passos e **cai** — e cai também com comando **zero**, que
+é a condição em que a `velstand` deveria simplesmente ficar parada em pé. Com o
+servo mole ele ficava de pé indefinidamente; com o servo que de fato segue o
+alvo, a atuação da política desestabiliza este corpo.
+
+A leitura é que a planta não é a que a política viu no treino, e há três
+candidatos, nenhum descartado:
+
+| | |
+|---|---|
+| **O atuador** | A política foi treinada contra um modelo de Dynamixel com folga — a tarefa de treino se chama `Mjlab-VelStand-Rough-Backlash-MicroDuck`. Aqui é um servo de posição ideal, e o torque está em 1,5 N·m contra os ~0,5 N·m de um XL330. |
+| **O contato** | Os pés são placas retangulares num chão com o atrito padrão do CoppeliaSim, não as solas do CAD. |
+| **A geometria de colisão** | Caixas de inércia, não as malhas. A massa e a inércia estão certas; a forma que toca o mundo não. |
+
+A varredura que cruzaria ganho × torque medindo tempo de pé ficou **por rodar**:
+o CoppeliaSim travou no meio (96 % de CPU, sem responder à Remote API) e o
+trabalho parou aí.
+
+### Por onde continuar
+
+1. Baixar o torque de cada junta para o do XL330 real (~0,5 N·m) e repetir.
+2. Subir o atrito dos pés e dar-lhes uma forma mais próxima da sola.
+3. Cruzar ganho × torque medindo **quanto tempo o pato fica de pé com comando
+   zero** — é o critério mais limpo, porque separa "a planta aguenta a
+   política" de "a marcha transfere".
+4. Se nada disso bastar, o caminho honesto é o `robotd` de verdade contra o
+   corpo MuJoCo do `microduck_rl`, para ter um ponto de comparação em que a
+   política comprovadamente anda.
+
 ## O que este corpo não é
 
 | | |
@@ -212,9 +314,13 @@ a parte que podia não fechar, fechou.
 | **Atuador** | Os servos do pato são Dynamixel, e as políticas foram treinadas contra um modelo deles (BAM, no `microduck_rl`). Aqui cada junta é uma junta em controle de posição do CoppeliaSim com limite de torque. Uma política de marcha não tem por que andar igual contra este atuador. |
 | **Aparência** | Caixas de inércia, não as malhas do pato. |
 | **Drivers** | O barramento Dynamixel, o rádio BLE, a câmera e a NPU não existem aqui — como não existem no simulador MuJoCo do projeto, pela mesma razão. |
-| **Equilíbrio** | Não há política. O pato de pé cai, e isso é o comportamento certo: quem o segura é o `robotd` com a política carregada. |
+| **Equilíbrio** | Com a política carregada o pato dá um ou dois passos e cai (ver §Andar). Sem ela, cai em quatro segundos. |
 
 O que ele serve para exercitar é tudo o que está **acima** do atuador, que é
 exatamente o que o `sim.rs` do Microduck diz do simulador MuJoCo: o laço de
 controle, a política, a segurança, a detecção de queda, a cinemática, a
 odometria e o IPC inteiro.
+
+E a ressalva ficou maior do que parecia no começo: **o atuador é justamente
+onde este corpo difere**, e uma política de locomoção é a coisa que mais
+depende dele. A costura funciona; a transferência da marcha, não ainda.

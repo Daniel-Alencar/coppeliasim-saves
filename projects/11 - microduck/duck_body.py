@@ -255,9 +255,18 @@ class Body:
         # Abaixo de 1 o mundo roda devagar, e isso NÃO é um erro: cada tique
         # continua adiantando exatamente um período de controle, e o daemon do
         # robô é quem dá o ritmo. O que seria erro é o passo VARIAR.
-        if self.ticks % 250 == 0:
+        if self.ticks % 50 == 0:
             factor = (self.ticks * CONTROL_PERIOD) / max(self.wall, 1e-9)
-            print(f'{self.ticks} tiques, {factor:.2f}x tempo real')
+            # A posição do tronco é a visão do SIMULADOR, não do robô: o
+            # protocolo não a carrega, e não carrega de propósito — um robô de
+            # verdade não sabe onde está. Ela vai no log do corpo, que é o
+            # equivalente do `duck-sim simlog`, para responder a única
+            # pergunta que o robô não pode responder sozinho: ele saiu do
+            # lugar?
+            where = self.sim.getObjectPosition(self.trunk, self.sim.handle_world)
+            print(f'{self.ticks:5d} tiques  {factor:.2f}x tempo real  '
+                  f'tronco x={where[0]*100:+6.1f} y={where[1]*100:+6.1f} '
+                  f'z={where[2]*100:5.1f} cm')
         return {}
 
     def op_gain(self, message):

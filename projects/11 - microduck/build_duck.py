@@ -88,6 +88,34 @@ MIN_SIZE = 0.004
 #: A sola de cada pé [m]: comprimento, largura, espessura.
 FOOT_PAD = (0.055, 0.035, 0.006)
 
+#: Ganho proporcional do servo de posição de cada junta.
+#:
+#: O padrão do CoppeliaSim é 0,1, e ele é MOLE demais para uma política de
+#: 50 Hz: um degrau de 0,3 rad leva 205 ms para assentar, dez tiques de
+#: controle. A política não é um gerador de marcha com relógio — ela é
+#: reativa, e a marcha nasce do laço fechado com o corpo. Se a junta não chega
+#: ao alvo dentro do tique, a realimentação nunca se desenvolve e o pato fica
+#: de pé parado, que foi exatamente o que a primeira corrida fez.
+#:
+#: Medido, com degrau de 0,3 rad no joelho:
+#:
+#:     P = 0,1    32 % em 20 ms, assenta em 205 ms
+#:     P = 1,0    78 % em 20 ms, assenta em  25 ms, sem overshoot
+#:     P = 3,0    78 % em 20 ms, assenta em  25 ms, overshoot de 0,032 rad
+#:     P = 10     idem, overshoot de 0,053 rad
+#:
+#: Acima de 1,0 não se ganha velocidade, só oscilação.
+#:
+#: A propriedade é POR MOTOR DE FÍSICA (`bullet.posPid`, `ode.posPid`, ...), e
+#: o `sim.setObjectFloatParam(h, sim.jointfloatparam_pid_p, ...)` — o caminho
+#: antigo e óbvio — não a alcança: ele aceita a escrita e o valor lido de volta
+#: continua 0,1. Custou uma varredura inteira de ganho que não mudava nada.
+SERVO_GAIN = 1.0
+
+#: Os motores de física cujo PID recebe `SERVO_GAIN`. Escrever em todos custa
+#: nada e faz a cena continuar valendo se alguém trocar de motor.
+ENGINES = ('bullet', 'ode', 'vortex', 'newton', 'mujoco')
+
 #: Só o byte alto da máscara de colisão: as peças do pato não colidem entre si.
 #: Num bípede de quinze corpos encostados isto não é otimização, é requisito —
 #: com a máscara cheia a coxa e a canela brigam a cada passo.
@@ -315,6 +343,9 @@ def build(sim, args):
         sim.setObjectInt32Param(joint, sim.jointintparam_dynctrlmode,
                                 sim.jointdynctrl_position)
         sim.setJointTargetForce(joint, args.torque)
+        for engine in ENGINES:
+            sim.setFloatArrayProperty(joint, f'{engine}.posPid',
+                                      [args.servo_gain, 0.0, 0.0])
 
         shape, _ = make_link(sim, body, joint, colour)
         shapes[body['name']] = shape
@@ -363,6 +394,9 @@ def main():
                              'do próprio MJCF, que já põe as solas no chão')
     parser.add_argument('--torque', type=float, default=1.5,
                         help='torque máximo de cada servo [N.m]')
+    parser.add_argument('--servo-gain', type=float, default=SERVO_GAIN,
+                        help='ganho P do servo de posição; o padrão do '
+                             'CoppeliaSim (0,1) é mole demais para 50 Hz')
     parser.add_argument('--dt', type=float, default=0.005,
                         help='passo da simulação [s]; o laço do robô é 50 Hz, '
                              'e um passo grosso não fecha um bípede')
@@ -397,6 +431,8 @@ def main():
           f'tronco a {height * 1000:.0f} mm')
     print(f'  passo da simulação: {args.dt * 1000:.0f} ms '
           f'(o laço de controle do robô é 50 Hz = 20 ms)')
+    print(f'  ganho do servo: P = {args.servo_gain:.1f} '
+          f'(o padrão 0,1 não segue o alvo dentro de um tique)')
     missing = [name for name in JOINT_ORDER if name not in info['joints']]
     print(f'  ausentes do MJCF, presentes no protocolo: '
           f'{", ".join(missing) if missing else "nenhuma"}')
