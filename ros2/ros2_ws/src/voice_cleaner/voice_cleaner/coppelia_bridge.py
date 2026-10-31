@@ -110,7 +110,10 @@ class CoppeliaBridge(Node):
         # --- De onde vem o mapa ----------------------------------------------
         # 'signals': lê as posições prontas dos sinais da cena (gabarito).
         # 'perception': não publica mapa nenhum; quem monta é o perception_map,
-        #   a partir do que a câmera vê. É o modo do exercício com YOLO.
+        #   a partir do que a câmera vê. É o modo do exercício com YOLO, e o
+        #   único em que as imagens da Kinect são obrigatórias.
+        # 'none': não publica mapa nem imagens. É o modo da casa, em que o mapa
+        #   é a planta publicada pelo house_map e a ponte só move o robô.
         self.declare_parameter('map_source', 'signals')
 
         # --- Câmera e TF ------------------------------------------------------
@@ -226,10 +229,15 @@ class CoppeliaBridge(Node):
                 1.0 / self.get_parameter('map_rate').value, self.publish_map
             )
             self.publish_map()
-        else:
+        elif self.map_source == 'perception':
             self.get_logger().info(
                 'map_source=perception: a ponte não publica o mapa. '
                 'Quem monta bananas e poops é o perception_map, pela câmera.'
+            )
+        else:
+            self.get_logger().info(
+                f'map_source={self.map_source}: a ponte só move o robô e '
+                'publica a pose; nenhum mapa sai daqui.'
             )
         # A câmera roda numa thread própria, com uma conexão própria ao
         # simulador. Medido: dentro do laço do ROS, cada ciclo de câmera

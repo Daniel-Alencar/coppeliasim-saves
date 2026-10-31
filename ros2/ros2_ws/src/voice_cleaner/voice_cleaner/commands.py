@@ -219,13 +219,18 @@ INTENTS = (
     Intent(
         'ir_para',
         'ir até um lugar, sem limpar no caminho',
-        ['ir para a sala', 'vai para a sala',
-         'ir para a cozinha', 'vai para a cozinha',
-         'ir para o quarto', 'vai para o quarto',
-         'ir para o banheiro', 'vai para o banheiro',
-         'ir para o corredor', 'vai para o corredor',
+        # Três formas do verbo por cômodo: o infinitivo ("ir para"), o
+        # indicativo ("vai para") e o imperativo ("vá para"), que é como se
+        # manda em alguém de verdade. Sem o imperativo, "vá para a cozinha"
+        # não casava com nada e o robô ignorava o comando mais natural de todos.
+        ['ir para a sala', 'vai para a sala', 'vá para a sala',
+         'ir para a cozinha', 'vai para a cozinha', 'vá para a cozinha',
+         'ir para o quarto', 'vai para o quarto', 'vá para o quarto',
+         'ir para o banheiro', 'vai para o banheiro', 'vá para o banheiro',
+         'ir para o corredor', 'vai para o corredor', 'vá para o corredor',
          'ir para o escritório', 'vai para o escritório',
-         'ir para a garagem', 'vai para a garagem'],
+         'vá para o escritório',
+         'ir para a garagem', 'vai para a garagem', 'vá para a garagem'],
         takes_place=True,
     ),
     Intent(

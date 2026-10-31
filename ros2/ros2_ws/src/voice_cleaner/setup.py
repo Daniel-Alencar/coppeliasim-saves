@@ -13,6 +13,10 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        ('share/' + package_name + '/config', glob('config/*')),
+        # O modelo do robô, que o house_builder carrega numa cena sem robô.
+        ('share/' + package_name + '/coppeliasim/robot',
+            glob('coppeliasim/robot/myRobot.ttm')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -31,6 +35,11 @@ setup(
             'voice_listener = voice_cleaner.voice_listener:main',
             'command_parser = voice_cleaner.command_parser:main',
             'command_console = voice_cleaner.command_console:main',
+            # A casa: mapa, navegação por cômodo e as paredes na cena
+            'house_map = voice_cleaner.house_map:main',
+            'house_navigator = voice_cleaner.house_navigator:main',
+            'position_control = voice_cleaner.position_control:main',
+            'house_builder = voice_cleaner.house_builder:main',
             # Base herdada do potential_field
             'coppelia_bridge = voice_cleaner.coppelia_bridge:main',
             'navigator = voice_cleaner.navigator:main',

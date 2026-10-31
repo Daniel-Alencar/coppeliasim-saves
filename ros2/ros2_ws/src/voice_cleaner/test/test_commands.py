@@ -17,6 +17,10 @@ from voice_cleaner import commands
     ('aspirador, mapear o ambiente', 'mapear'),
     ('volta para a base', 'voltar_base'),
     ('vai para o quarto', 'ir_para'),
+    # O imperativo é como se manda em alguém; faltava, e era a forma mais
+    # natural de pedir ("vá para a cozinha" ficava sem casar com nada).
+    ('vá para a cozinha', 'ir_para'),
+    ('robô, vá para o escritório agora', 'ir_para'),
     ('limpar aqui', 'limpar_aqui'),
     ('mais devagar', 'ajustar_velocidade'),
     ('qual o nível da bateria', 'status'),
