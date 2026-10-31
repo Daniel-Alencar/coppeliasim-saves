@@ -4,6 +4,10 @@ Robô aspirador que **recebe comandos por voz**. O reconhecimento é offline, em
 português, e o comando reconhecido sai num tópico ROS 2. É o trabalho descrito
 em [requirements.md](requirements.md).
 
+O robô **transcreve tudo o que for falado** e **age só no que sabe fazer**: o
+reconhecedor trabalha com o vocabulário inteiro do português, e é o
+interpretador que separa comando de conversa.
+
 ```
 microfone → Vosk (offline) → texto → intenção + argumentos → voice/command
 ```
@@ -42,8 +46,14 @@ Os cinco últimos vêm do `potential_field` sem mudança de comportamento.
 ## 1. Pré-requisitos
 
 - ROS 2 Jazzy (`/opt/ros/jazzy`)
-- `libportaudio2` (já vem no Ubuntu 24.04; é a biblioteca de áudio que o
-  `sounddevice` usa)
+- `libportaudio2`, a biblioteca de áudio que o `sounddevice` usa. Nem toda
+  instalação do Ubuntu 24.04 já a tem; sem ela o `sounddevice` nem importa
+  (`OSError: PortAudio library not found`):
+
+```bash
+sudo apt-get install -y libportaudio2
+```
+
 - No Python do sistema (o `ros2 run` não usa o `.venv/`):
 
 ```bash
@@ -71,6 +81,35 @@ aponte a pasta:
 ros2 launch voice_cleaner voice.launch.py model_path:=$HOME/vosk-model-small-pt-0.3
 ```
 
+**O download automático tem um bug no vosk 0.3.45.** Vale conhecê-lo porque o
+sintoma não diz o que fazer. O `Model(lang='pt')` procura o modelo varrendo
+`~/.cache/vosk/` com a regex `vosk-model(-small)?-pt` e aceita a primeira
+entrada que casar (`get_model_by_lang`, em `vosk/__init__.py`). O zip que ele
+mesmo acabou de baixar casa tanto quanto a pasta extraída, e quando o
+`os.listdir` o entrega primeiro o reconhecedor morre assim:
+
+```
+ERROR (VoskAPI:Model():model.cc:122) Folder '~/.cache/vosk/vosk-model-small-pt-0.3.zip'
+does not contain model files.
+[voice_listener]: não consegui carregar o modelo: Failed to create a model
+```
+
+Um download interrompido também deixa a pasta pela metade — faltando
+`HCLr.fst`, `mfcc.conf` ou arquivos do `ivector/` —, com o mesmo erro no fim.
+Para consertar as duas coisas de uma vez, extraia de novo e apague o zip:
+
+```bash
+cd ~/.cache/vosk
+unzip -t vosk-model-small-pt-0.3.zip        # confirma que o zip está íntegro
+rm -rf vosk-model-small-pt-0.3
+unzip -q vosk-model-small-pt-0.3.zip
+rm vosk-model-small-pt-0.3.zip              # o zip no cache é que confunde o vosk
+```
+
+A pasta correta tem 9 entradas, entre elas `final.mdl`, `Gr.fst`, `HCLr.fst`,
+`mfcc.conf` e `ivector/` com 6 arquivos. Passar `model_path` à mão evita a
+busca por regex inteira, e é o caminho à prova desse bug.
+
 ---
 
 ## 2. Compilar
@@ -78,9 +117,14 @@ ros2 launch voice_cleaner voice.launch.py model_path:=$HOME/vosk-model-small-pt-
 ```bash
 cd ros2/ros2_ws
 colcon build --packages-select voice_cleaner --symlink-install
-source install/setup.zsh     # no zsh; use setup.bash se a sua shell for bash
+source install/setup.bash    # no zsh, install/setup.zsh
 ros2 pkg executables voice_cleaner
 ```
+
+O `--symlink-install` faz os `.py` do nó valerem direto da árvore de fontes, sem
+recompilar a cada edição — **mas não os launch files**, que são copiados para
+`install/`. Mexeu em `launch/`, compile de novo, senão o launch que roda é o
+antigo e o sintoma é mudança que "não pegou".
 
 ---
 
@@ -94,13 +138,46 @@ ros2 pkg executables voice_cleaner
 ros2 launch voice_cleaner voice.launch.py
 ```
 
-Fale um comando. O terminal mostra o que foi ouvido e o que foi entendido:
+Fale. O robô transcreve tudo o que ouve, e o terminal mostra o que ele fez com
+cada frase — comando quando é tarefa dele, nada quando não é:
 
 ```
-[voice_listener]: gramática fechada com 108 palavras
+[voice_listener]: vocabulário completo do português: transcrevo tudo o que for dito, ...
 [voice_listener]: ouvindo o microfone (dispositivo padrão); fale um comando
 [voice_listener]: ouvi: "robô limpa a cozinha" (confiança 0.94)
 [command_parser]: comando: limpar_local local=cozinha  <- "robô limpa a cozinha"
+[voice_listener]: ouvi: "você viu o jogo ontem" (confiança 0.88)
+[command_parser]: ouvido, mas não é tarefa minha: "você viu o jogo ontem"
+```
+
+A segunda frase foi transcrita e descartada: isso é o funcionamento normal, não
+falha de reconhecimento. `voice/transcript` tem tudo; `voice/command`, só o que
+ele sabe executar.
+
+Se o nó sobe e ouve mas o texto não tem nada a ver com o que você disse, o
+problema costuma ser a entrada de áudio, não o reconhecedor. Para ver as
+entradas:
+
+```bash
+ros2 run voice_cleaner voice_listener --ros-args -p list_devices:=true
+```
+
+```
+   7 USB PnP Sound Device: Audio (hw:1,0), ALSA (1 in, 2 out)
+*  11 default, ALSA (64 in, 64 out)
+```
+
+A padrão (`*`) é a do servidor de som, que normalmente serve. Com microfone USB
+ou headset, apontar o dispositivo direto costuma captar melhor:
+
+```bash
+ros2 launch voice_cleaner voice.launch.py device:=7
+```
+
+E, falando, o nível tem de passar de −40 dBFS:
+
+```bash
+ros2 topic echo /myRobot/voice/level
 ```
 
 Noutro terminal, o comando como ele sai no tópico:
@@ -113,6 +190,97 @@ ros2 topic echo /myRobot/voice/command
 data: '{"intent": "limpar_local", "args": {"local": "cozinha"},
         "texto": "robo limpa a cozinha", "score": 2, "stamp": 1793285571.711}'
 ```
+
+### Conferindo que ele ouve tudo e age só no que sabe
+
+Os dois lados do comportamento ficam visíveis lado a lado em três terminais.
+No primeiro, o launch; nos outros dois, os tópicos que separam a fala do
+comando:
+
+```bash
+ros2 topic echo /myRobot/voice/transcript   # tudo o que foi dito
+ros2 topic echo /myRobot/voice/intent       # só o que ele vai fazer
+```
+
+Agora fale duas frases, uma de cada tipo — por exemplo "robô, limpa a cozinha"
+e depois "você viu o jogo ontem". As duas aparecem em `voice/transcript`;
+só a primeira aparece em `voice/intent`. É esse o teste: **transcript enche,
+intent é seletivo.**
+
+#### Publicando a transcrição à mão
+
+Para conferir a separação sem reconhecimento de fala no meio — útil para isolar
+o interpretador de problemas de áudio, e o jeito mais direto de repetir sempre
+a mesma frase. Num terminal, só o interpretador:
+
+```bash
+ros2 run voice_cleaner command_parser --ros-args -r __ns:=/myRobot
+```
+
+Noutro, as frases:
+
+```bash
+ros2 topic pub -1 /myRobot/voice/transcript std_msgs/String \
+  "{data: 'robô limpa a cozinha'}"
+ros2 topic pub -1 /myRobot/voice/transcript std_msgs/String \
+  "{data: 'você viu o jogo ontem à noite'}"
+ros2 topic pub -1 /myRobot/voice/transcript std_msgs/String \
+  "{data: 'preciso lembrar de comprar pão'}"
+```
+
+O interpretador responde a cada uma:
+
+```
+[command_parser]: comando: limpar_local local=cozinha  <- "robô limpa a cozinha"
+[command_parser]: ouvido, mas não é tarefa minha: "você viu o jogo ontem à noite"
+[command_parser]: ouvido, mas não é tarefa minha: "preciso lembrar de comprar pão"
+```
+
+#### Vendo o falso positivo, e a defesa
+
+Vale conhecer o ponto fraco antes de topar com ele em uso. Como `parar`,
+`pausar`, `continuar` e `status` são comandos de uma palavra, conversa que
+contenha a palavra casa:
+
+```bash
+ros2 topic pub -1 /myRobot/voice/transcript std_msgs/String \
+  "{data: 'pode parar de falar nisso'}"
+```
+
+```
+[command_parser]: comando: parar  <- "pode parar de falar nisso"
+```
+
+Suba o interpretador com `min_score:=2` e a mesma frase passa a ser recusada,
+porque duas palavras casadas obrigam a dizer "para tudo":
+
+```bash
+ros2 run voice_cleaner command_parser --ros-args -r __ns:=/myRobot -p min_score:=2
+```
+
+```
+[command_parser]: "pode parar de falar nisso" parece parar, mas casou só 1 palavra(s) de 2: ignorado
+```
+
+**`min_score:=2` tem um custo que vale medir antes de adotar:** `pausar` e
+`continuar` ficam impossíveis de dizer, porque nenhuma forma delas tem duas
+palavras ("pausar", "pausa", "espera" — todas valem 1). Os outros dez comandos
+sobrevivem, alguns trocando de forma: `parar` exige "para tudo" em vez de
+"parar", e `status` exige "como está" ou "o que está fazendo" em vez de
+"status". Para conferir você mesmo:
+
+```bash
+PYTHONPATH=. /usr/bin/python3 -c "
+from voice_cleaner import commands
+for it in commands.INTENTS:
+    n = max(len(commands.tokenize(p)) for p in it.raw_phrases)
+    print(f'{it.name:20s} maior frase = {n} palavra(s)')"
+```
+
+Por isso o padrão é `min_score:=1`: ele aceita o vocabulário inteiro, ao preço
+dos falsos positivos acima. `wake_word:=robo` é a defesa que não custa comando
+nenhum — exige só que você chame o robô pelo nome antes de mandar. A seção 6
+discute a escolha.
 
 ### Sem microfone: digitando
 
@@ -174,7 +342,7 @@ Valem para `voice.launch.py` e, repassados, para os outros dois.
 | `model_path` | `''` | Pasta do modelo Vosk; vazio baixa o modelo do idioma |
 | `lang` | `pt` | Idioma do modelo baixado |
 | `device` | `''` | Entrada de áudio (índice ou parte do nome); vazio usa a padrão |
-| `grammar` | `true` | `false` reconhece com o vocabulário inteiro do português |
+| `grammar` | `false` | Padrão transcreve toda a fala; `true` restringe o reconhecedor aos comandos |
 | `min_confidence` | `0.0` | Descarta transcrição com confiança média abaixo disto |
 | `wake_word` | `''` | Palavra de ativação; vazio aceita qualquer frase |
 | `min_score` | `1` | Palavras que a frase precisa casar para virar comando |
@@ -217,7 +385,7 @@ novos; os outros vêm do `potential_field`.
 
 | Tópico | Tipo | Quem publica | Conteúdo |
 |---|---|---|---|
-| `voice/transcript` | `std_msgs/String` | `voice_listener` ou `command_console` | Frase reconhecida (ou digitada) |
+| `voice/transcript` | `std_msgs/String` | `voice_listener` ou `command_console` | Toda frase reconhecida (ou digitada), comando ou não |
 | `voice/partial` | `std_msgs/String` | `voice_listener` | Hipótese do meio da frase; não vira comando |
 | `voice/level` | `std_msgs/Float32` | `voice_listener` | Nível do áudio em dBFS, 2 Hz; serve para ver se o microfone capta |
 | `voice/command` | `std_msgs/String` | `command_parser` | O comando, em JSON (ver abaixo) |
@@ -250,15 +418,35 @@ fora e tem latência previsível, que é o que importa num robô. O modelo peque
 de português carrega em menos de um segundo e divide a CPU com o simulador sem
 briga.
 
-**A gramática fechada** é o que faz o acerto subir. O Vosk aceita receber, em
-vez do vocabulário inteiro do idioma, a lista de palavras que podem aparecer.
-Como o robô só entende uma dúzia de comandos, essa lista tem 108 palavras e o
-reconhecedor passa a escolher sempre dentro dela: "limpa a cozinha" deixa de
-virar "limpa a buzina". O preço é que tudo fora da lista sai como `[unk]` ou
-como a palavra mais parecida — exatamente o desejado para um robô que só tem o
-que fazer com esses comandos. `grammar:=false` desliga, para comparar.
+**Ele transcreve tudo, e só obedece ao que sabe fazer.** O reconhecedor usa o
+vocabulário inteiro do português, então `voice/transcript` traz toda fala que
+chega ao microfone, como foi dita — comando ou conversa. A seleção é do
+`command_parser`, que publica em `voice/command` só as intenções de
+`commands.py` e deixa o resto no log. São duas responsabilidades separadas de
+propósito: o reconhecedor é um ouvido, não um filtro, e ter o registro fiel da
+fala distingue "ouviu errado" de "não é tarefa dele", que é a dúvida mais comum
+ao depurar.
 
-**As palavras da gramática vão com acento.** O léxico do modelo português é
+**A gramática fechada** (`grammar:=true`) é a alternativa. O Vosk aceita
+receber, em vez do vocabulário do idioma, a lista de palavras que podem
+aparecer; para esses comandos ela tem 108 palavras, e o reconhecedor passa a
+escolher sempre dentro dela: "limpa a cozinha" deixa de virar "limpa a buzina".
+O preço é que tudo fora da lista sai como `[unk]` ou como a palavra mais
+parecida, e o robô deixa de registrar o que foi dito de fato. Vale em ambiente
+barulhento, onde só os comandos importam, ou em CPU apertada — medido aqui com
+o modelo pequeno de português, a gramática decodifica a 0,07 do tempo real
+contra 0,17 do vocabulário completo (7% contra 17% de um núcleo).
+
+O lado ruim do vocabulário aberto é que a conversa da sala também é transcrita,
+e uma frase qualquer pode casar com um comando por acidente — "pode parar de
+falar nisso" contém "parar". Duas defesas existem, com custos diferentes:
+`min_score:=2` exige frase mais completa, mas deixa `pausar` e `continuar`
+impossíveis de dizer (nenhuma forma delas tem duas palavras); `wake_word:=robo`
+exige o nome do robô antes e não custa comando nenhum. Os dois vêm desligados,
+e a seção 3 tem como experimentar cada um.
+
+**As palavras da gramática vão com acento** — vale quando ela está ligada, e a
+invariante é testada de qualquer jeito. O léxico do modelo português é
 acentuado: pedir `robo`, `rapido` ou `relatorio` faz o Vosk responder *Ignoring
 word missing in vocabulary* e a palavra fica impossível de reconhecer. Por
 isso as frases em `commands.py` são escritas com acento, e é a comparação com a
@@ -312,7 +500,7 @@ custo de exigir uma palavra que o reconhecedor também pode errar.
 | `model_path` | `''` | Pasta do modelo; vazio pede o modelo do idioma ao Vosk |
 | `lang` | `pt` | Idioma, quando `model_path` está vazio |
 | `sample_rate` | `16000` | O Vosk trabalha a 16 kHz; o servidor de som reamostra |
-| `grammar` | `true` | Restringe o reconhecedor ao vocabulário dos comandos |
+| `grammar` | `false` | `true` restringe o reconhecedor ao vocabulário dos comandos |
 | `min_confidence` | `0.0` | Confiança média mínima para publicar a transcrição |
 | `publish_partial` | `true` | Publicar as hipóteses do meio da frase |
 | `list_devices` | `false` | Lista as entradas de áudio e sai |
@@ -327,7 +515,7 @@ custo de exigir uma palavra que o reconhecedor também pode errar.
 |---|---|---|
 | `wake_word` | `''` | Palavra de ativação; vazio aceita qualquer frase |
 | `wake_timeout` | `8.0` | Quanto tempo a ativação continua valendo (s) |
-| `min_score` | `1` | Palavras que a frase precisa casar; `2` erra menos |
+| `min_score` | `1` | Palavras que a frase precisa casar. `2` erra menos com conversa, mas torna `pausar` e `continuar` impossíveis de dizer |
 | `repeat_window` | `1.5` | Mesmo comando dentro disto é ignorado (s) |
 | `print_help` | `true` | Imprimir a lista de comandos ao subir |
 
@@ -353,10 +541,21 @@ PYTHONPATH=. /usr/bin/python3 -m pytest test/test_commands.py -q
 ```
 
 Cobre o que o robô deve entender (frase com enfeite em volta, sem acento, em
-maiúsculas), o que ele **não** deve entender (conversa), a extração do
-argumento, a prioridade entre frase específica e genérica, e duas invariantes
-que já quebraram: toda palavra das frases estar na gramática, e as palavras da
-gramática saírem acentuadas.
+maiúsculas), o que ele **não** deve entender (conversa, inclusive falando do
+lugar sem mandar limpá-lo: "a cozinha é o lugar mais quente da casa"), a
+extração do argumento, a prioridade entre frase específica e genérica, e duas
+invariantes que já quebraram: toda palavra das frases estar na gramática, e as
+palavras da gramática saírem acentuadas.
+
+Isto é o vocabulário sozinho; para conferir a cadeia de pé — transcrição de
+tudo, comando só do que ele sabe fazer — o roteiro está na seção 3.
+
+Um teste cuida do ponto fraco do vocabulário aberto. Conversa que contém a
+palavra do comando casa, e não há como evitar: `parar`, `pausar`, `continuar` e
+`status` são intenções de uma palavra, então "pode parar de falar nisso" casa
+com `parar`. O teste garante que o casamento continue valendo **1 palavra só** —
+é o que mantém `min_score:=2` capaz de filtrá-las. Se algum dia uma dessas
+frases subir para 2, a defesa cai calada, e o teste quebra antes.
 
 ---
 
@@ -364,13 +563,17 @@ gramática saírem acentuadas.
 
 | Sintoma | O que fazer |
 |---|---|
-| `ModuleNotFoundError: vosk` ou `sounddevice` | Instale como na seção 1, no Python do sistema |
-| `não consegui carregar o modelo` | Sem rede na primeira execução: baixe o modelo à mão e passe `model_path` |
-| `nenhum bloco de áudio chegou ainda` | Entrada errada ou muda: veja `-p list_devices:=true` e passe `device:=<índice>` |
+| `ModuleNotFoundError: vosk` ou `sounddevice` | Instale como na seção 1, no Python do sistema. O `ros2 run` não vê o `.venv/`, então instalar lá não resolve |
+| `OSError: PortAudio library not found` | Falta a biblioteca do sistema: `sudo apt-get install -y libportaudio2` |
+| `Folder '...vosk-model-small-pt-0.3.zip' does not contain model files` | O zip sobrou no cache e o vosk o escolheu em vez da pasta. Refaça a extração como na seção 1 |
+| `não consegui carregar o modelo` | Sem rede na primeira execução: baixe o modelo à mão e passe `model_path`. Com o modelo já em `~/.cache/vosk`, é a extração incompleta ou o zip sobrando — seção 1 |
+| `nenhum bloco de áudio chegou ainda` | Entrada errada ou muda: veja `-p list_devices:=true` e passe `device:=<índice>`. Num notebook com microfone USB, a entrada padrão não é sempre a que capta |
 | O nó ouve, mas o texto não tem nada a ver | Confira o nível em `voice/level`: acima de −40 dBFS enquanto você fala. Microfone longe ou ganho baixo é a causa mais comum |
+| Transcreve certo, mas o comando não sai | Veja o log do `command_parser`: `ouvido, mas não é tarefa minha` quer dizer que a frase não casou com intenção nenhuma. Confira a forma de dizer na seção 4, ou acrescente a sua em `commands.py` |
+| Erra justamente a palavra do comando ("cozinha" sai "buzina") | É o custo do vocabulário aberto. `grammar:=true` prende o reconhecedor às 108 palavras dos comandos, ao preço de não transcrever mais o resto da fala |
 | `Ignoring word missing in vocabulary: 'xxx'` | Palavra nova em `commands.py` sem acento, ou que não existe no léxico do modelo. Escreva com acento; se continuar, troque por um sinônimo |
-| Reconhece comando quando ninguém falou com ele | Suba com `wake_word:=robo`, ou `min_score:=2` |
+| Reconhece comando quando ninguém falou com ele | Esperado com o vocabulário aberto, que transcreve a conversa toda. `wake_word:=robo` resolve sem custo; `min_score:=2` também filtra, mas perde `pausar` e `continuar` (seção 3) |
 | O mesmo comando chega duas vezes | Aumente `repeat_window` |
 | Quer testar a interpretação sem falar | `command_console`, ou `console:=1` no launch |
-| `Package 'voice_cleaner' not found` | Faltou sourcear o workspace; no zsh, `install/setup.zsh` |
+| `Package 'voice_cleaner' not found` | Faltou sourcear o workspace: `source install/setup.bash` (ou `.zsh`). Sourcear o arquivo da outra shell dá `bad substitution` e não registra o pacote |
 | Problema da ponte, do YOLO ou do navegador | É a base herdada: veja a seção 8 do README do `potential_field` |

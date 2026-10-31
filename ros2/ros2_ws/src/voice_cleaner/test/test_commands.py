@@ -62,11 +62,41 @@ def test_velocidade_extraida(frase, velocidade):
     '   ',
     'bom dia tudo bem',
     'o jantar está pronto',
+    # Com o vocabulário aberto o robô transcreve a conversa da sala, então
+    # estas chegam ao interpretador de verdade. Falar do lugar não é mandar
+    # limpar o lugar: é a distinção que o casamento por conjunto mantém.
+    'a sala está muito bonita hoje',
+    'a cozinha é o lugar mais quente da casa',
+    'o quarto do meu filho é ali',
+    'tenho que ir para o trabalho amanhã',
+    'você viu o jogo ontem à noite',
 ])
 def test_conversa_nao_vira_comando(frase):
     intent, _, score = commands.parse(frase)
     assert intent is None
     assert score == 0
+
+
+@pytest.mark.parametrize('frase, intencao', [
+    ('pode parar de falar nisso', 'parar'),
+    ('espera um pouco que eu já vou', 'pausar'),
+    ('vamos continuar a conversa depois', 'continuar'),
+    ('qual o status do projeto', 'status'),
+])
+def test_conversa_com_palavra_de_comando_casa_fraco(frase, intencao):
+    """Conversa que contém a palavra do comando casa — com score 1.
+
+    As intenções de uma palavra (parar, pausar, continuar, status) não têm como
+    exigir mais do que a própria palavra, então uma frase de conversa que a
+    contenha casa inevitavelmente. Não é bug do casamento: é o motivo de o
+    command_parser ter ``min_score`` e ``wake_word``. O que o teste garante é
+    que o casamento continue *fraco*, de uma palavra só — se algum dia uma
+    destas subir para 2, ``min_score:=2`` deixa de ser defesa e o robô passa a
+    obedecer à conversa.
+    """
+    intent, _, score = commands.parse(frase)
+    assert intent.name == intencao
+    assert score == 1
 
 
 def test_frase_especifica_ganha_da_generica():

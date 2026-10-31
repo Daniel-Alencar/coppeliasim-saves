@@ -16,15 +16,26 @@ O reconhecimento roda na própria máquina: não depende de internet, não manda
 modelo pequeno de português (~40 MB) carrega em poucos segundos e cabe na CPU
 junto com o simulador.
 
-A gramática fechada
--------------------
-O Vosk aceita receber, em vez do vocabulário inteiro do idioma, a lista de
-palavras que podem aparecer. Como o robô só entende uma dúzia de comandos
-(ver commands.py), essa lista é curta e o reconhecedor passa a escolher sempre
-dentro dela: "limpa a cozinha" deixa de virar "limpa a buzina". O preço é que
-tudo fora da lista sai como ``[unk]`` ou como a palavra mais parecida — o que
-é exatamente o desejado para um robô que só tem o que fazer com esses
-comandos. O parâmetro ``grammar`` desliga isso, para comparar.
+Ouvir tudo, obedecer ao que sabe fazer
+--------------------------------------
+Por padrão o reconhecedor trabalha com o vocabulário inteiro do português:
+toda fala que chega ao microfone é transcrita como foi dita, comando ou
+conversa. A seleção acontece depois, no command_parser, que publica comando só
+para as intenções de commands.py e descarta o resto. As duas coisas ficam
+separadas de propósito: este nó é um ouvido, não um filtro, e
+``voice/transcript`` é o registro fiel do que foi falado — útil para depurar
+("ele ouviu errado" é diferente de "ele não entendeu") e para qualquer coisa
+que venha a querer a fala completa.
+
+A alternativa é a **gramática fechada** (``grammar:=true``): o Vosk aceita
+receber, em vez do vocabulário do idioma, a lista de palavras que podem
+aparecer (``commands.vocabulary()``). O reconhecedor passa a escolher sempre
+dentro dela, e "limpa a cozinha" não vira "limpa a buzina"; o preço é que tudo
+fora da lista sai como ``[unk]`` ou como a palavra mais parecida, e o robô
+deixa de registrar o que de fato foi dito. Vale quando o ambiente é barulhento
+e só os comandos importam, ou numa CPU apertada: medido com o modelo pequeno de
+português, a gramática decodifica a ~0,07 do tempo real contra ~0,17 do
+vocabulário completo.
 
 O modelo
 --------
@@ -70,9 +81,12 @@ class VoiceListener(Node):
         # O Vosk trabalha a 16 kHz; o servidor de som reamostra se o microfone
         # só tiver 44,1 ou 48 kHz.
         self.declare_parameter('sample_rate', 16000)
-        self.declare_parameter('grammar', True)
+        # Falso por padrão: o robô transcreve tudo o que for dito, e é o
+        # command_parser que decide o que vale como comando (ver o cabeçalho).
+        self.declare_parameter('grammar', False)
         # Transcrição com confiança média abaixo disto é descartada. 0.0 aceita
-        # tudo; com a gramática fechada a confiança costuma ficar alta.
+        # tudo, que é o padrão: com o vocabulário aberto, descartar por
+        # confiança jogaria fora justamente a fala livre que se quer registrar.
         self.declare_parameter('min_confidence', 0.0)
         # Publicar os resultados parciais (o que o Vosk tem no meio da frase).
         # Úteis para ver que o microfone está vivo; não viram comando.
@@ -184,6 +198,10 @@ class VoiceListener(Node):
                 self.recognizer = KaldiRecognizer(model, rate)
         else:
             self.recognizer = KaldiRecognizer(model, rate)
+            self.get_logger().info(
+                'vocabulário completo do português: transcrevo tudo o que for '
+                'dito, e o command_parser separa o que é comando '
+                '(grammar:=true restringe o reconhecedor aos comandos)')
         self.recognizer.SetWords(True)   # confiança por palavra
 
     def open_microphone(self):

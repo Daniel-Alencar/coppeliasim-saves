@@ -13,6 +13,22 @@ e executá-los é o passo seguinte. Deixar o comando num tópico, e não numa
 chamada direta ao navegador, é o que permite plugar a execução depois sem
 mexer em nada daqui.
 
+Este nó é o filtro da camada de voz
+-----------------------------------
+O voice_listener transcreve tudo o que for dito, conversa inclusive. É aqui que
+a fala é separada: ``voice/command`` só recebe as intenções de commands.py, e o
+que não é tarefa para o robô fica no log ("ouvido, mas não é tarefa minha") e
+não vai para tópico nenhum. Então a maior parte da fala parar neste nó é o
+funcionamento normal, não falha de reconhecimento — para ver o que o robô de
+fato ouviu, ``voice/transcript``.
+
+Com o vocabulário aberto, a conversa da sala passa a ser transcrita, e uma
+frase qualquer pode casar com um comando por acidente ("pode parar de falar
+nisso" tem "parar"). ``wake_word:=robo`` exige o nome do robô antes e é a
+defesa que não custa comando nenhum. ``min_score:=2`` também filtra, exigindo
+frase mais completa, mas aí ``pausar`` e ``continuar`` ficam impossíveis de
+dizer: nenhuma forma delas tem duas palavras. Os dois vêm desligados.
+
 O formato do comando
 --------------------
 Um JSON dentro de std_msgs/String:
@@ -103,7 +119,9 @@ class CommandParser(Node):
 
         intent, args, score = commands.parse(texto)
         if intent is None:
-            self.get_logger().info(f'não entendi: "{texto}"')
+            # O caminho normal, não uma exceção: o voice_listener transcreve
+            # toda a fala, e a maior parte dela não é tarefa para o robô.
+            self.get_logger().info(f'ouvido, mas não é tarefa minha: "{texto}"')
             return
         minimo = self.get_parameter('min_score').value
         if score < minimo:

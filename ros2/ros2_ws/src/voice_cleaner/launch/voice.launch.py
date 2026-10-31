@@ -40,8 +40,9 @@ def generate_launch_description():
         'device', default_value='',
         description='Entrada de áudio (índice ou parte do nome); vazio usa a padrão')
     grammar_arg = DeclareLaunchArgument(
-        'grammar', default_value='true',
-        description='true restringe o reconhecedor ao vocabulário dos comandos')
+        'grammar', default_value='false',
+        description='true restringe o reconhecedor ao vocabulário dos comandos; '
+                    'false (padrão) transcreve toda a fala')
     min_confidence_arg = DeclareLaunchArgument(
         'min_confidence', default_value='0.0',
         description='Descarta transcrição com confiança média abaixo disto')
